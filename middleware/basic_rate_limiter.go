@@ -15,6 +15,8 @@ import (
 	"net/http"
 )
 
+var _ RateLimiter = (*BasicRateLimiter)(nil)
+
 // BasicRateLimiterConfig for global rate limiting only
 type BasicRateLimiterConfig struct {
 	Rate               rate.Limit  // Global requests per second (shared by ALL clients)

@@ -18,6 +18,8 @@ import (
 	"net/http"
 )
 
+var _ RateLimiter = (*IPRateLimiter)(nil)
+
 // IPRateLimiterConfig for IP-based rate limiting
 type IPRateLimiterConfig struct {
 	Rate               rate.Limit    // Requests per second PER IP
