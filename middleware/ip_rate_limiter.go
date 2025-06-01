@@ -74,14 +74,11 @@ type IPRateLimiter struct {
 
 // IPStats holds statistics about IP rate limiting
 type IPStats struct {
-	TotalIPs        int64
+	*BaseStats
 	ActiveIPs       int64
-	TotalRequests   int64
-	AllowedRequests int64
-	BlockedRequests int64
+	TotalIPs        int64
 	WhitelistedReqs int64
 	BlacklistedReqs int64
-	StartTime       time.Time
 }
 
 // NewIPRateLimiter creates a new IP-based rate limiter
@@ -109,7 +106,10 @@ func NewIPRateLimiter(config *IPRateLimiterConfig) *IPRateLimiter {
 		config:      config,
 		stopCleanup: make(chan struct{}),
 		stats: &IPStats{
-			StartTime: time.Now(),
+			BaseStats: &BaseStats{
+				StartTime:   time.Now(),
+				LimiterType: IPType,
+			},
 		},
 	}
 
@@ -320,6 +320,7 @@ func (ipr *IPRateLimiter) getLimiterForIP(ip string) *rate.Limiter {
 
 		// Update stats
 		atomic.AddInt64(&ipr.stats.TotalIPs, 1)
+		atomic.StoreInt64(&ipr.stats.ActiveIPs, int64(len(ipr.limiters)))
 	} else {
 		entry.lastAccess = time.Now()
 	}
@@ -533,21 +534,11 @@ func (ipr *IPRateLimiter) Middleware() gin.HandlerFunc {
 }
 
 // GetStats returns IP rate limiting statistics
-func (ipr *IPRateLimiter) GetStats() IPStats {
-	ipr.mu.RLock()
-	activeIPs := int64(len(ipr.limiters))
-	ipr.mu.RUnlock()
-
-	return IPStats{
-		TotalIPs:        atomic.LoadInt64(&ipr.stats.TotalIPs),
-		ActiveIPs:       activeIPs,
-		TotalRequests:   atomic.LoadInt64(&ipr.stats.TotalRequests),
-		AllowedRequests: atomic.LoadInt64(&ipr.stats.AllowedRequests),
-		BlockedRequests: atomic.LoadInt64(&ipr.stats.BlockedRequests),
-		WhitelistedReqs: atomic.LoadInt64(&ipr.stats.WhitelistedReqs),
-		BlacklistedReqs: atomic.LoadInt64(&ipr.stats.BlacklistedReqs),
-		StartTime:       ipr.stats.StartTime,
-	}
+func (ipr *IPRateLimiter) GetStats() Stats {
+	ipr.stats.TotalRequests = atomic.LoadInt64(&ipr.stats.BaseStats.TotalRequests)
+	ipr.stats.AllowedRequests = atomic.LoadInt64(&ipr.stats.BaseStats.AllowedRequests)
+	ipr.stats.BlockedRequests = atomic.LoadInt64(&ipr.stats.BaseStats.BlockedRequests)
+	return ipr.stats
 }
 
 // GetIPStats returns statistics for a specific IP
@@ -574,6 +565,14 @@ func (ipr *IPRateLimiter) ResetStats() {
 	atomic.StoreInt64(&ipr.stats.WhitelistedReqs, 0)
 	atomic.StoreInt64(&ipr.stats.BlacklistedReqs, 0)
 	ipr.stats.StartTime = time.Now()
+}
+
+func (ipr *IPRateLimiter) Type() RateLimiterType {
+	return IPType
+}
+
+func (ipr *IPRateLimiter) Algorithm() Algorithm {
+	return TokenBucketAlg
 }
 
 // =============================================================================

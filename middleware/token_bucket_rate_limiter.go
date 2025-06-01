@@ -17,6 +17,8 @@ import (
 	"net/http"
 )
 
+var _ RateLimiter = (*TokenBucketLimiter)(nil)
+
 // TokenBucketConfig for token bucket rate limiting
 type TokenBucketConfig struct {
 	Rate               rate.Limit                // Token refill rate (requests per second)
@@ -69,15 +71,12 @@ type TokenBucketLimiter struct {
 
 // TokenBucketStats holds statistics about token bucket rate limiting
 type TokenBucketStats struct {
+	*BaseStats
 	TotalClients    int64
 	ActiveClients   int64
-	TotalRequests   int64
-	AllowedRequests int64
-	BlockedRequests int64
 	WaitedRequests  int64 // Requests that had to wait but succeeded
 	TimeoutRequests int64 // Requests that timed out while waiting
 	TotalWaitTime   int64 // Total time spent waiting (in nanoseconds)
-	StartTime       time.Time
 }
 
 // NewTokenBucketLimiter creates a new token bucket rate limiter
@@ -110,7 +109,9 @@ func NewTokenBucketLimiter(config *TokenBucketConfig) *TokenBucketLimiter {
 		config:      config,
 		stopCleanup: make(chan struct{}),
 		stats: &TokenBucketStats{
-			StartTime: time.Now(),
+			BaseStats: &BaseStats{
+				StartTime: time.Now(),
+			},
 		},
 	}
 
@@ -487,21 +488,24 @@ func (tbl *TokenBucketLimiter) Middleware() gin.HandlerFunc {
 }
 
 // GetStats returns token bucket statistics
-func (tbl *TokenBucketLimiter) GetStats() TokenBucketStats {
+func (tbl *TokenBucketLimiter) GetStats() Stats {
 	tbl.mu.RLock()
 	activeClients := int64(len(tbl.limiters))
 	tbl.mu.RUnlock()
 
 	return TokenBucketStats{
+		BaseStats: &BaseStats{
+			TotalRequests:   atomic.LoadInt64(&tbl.stats.TotalRequests),
+			AllowedRequests: atomic.LoadInt64(&tbl.stats.AllowedRequests),
+			BlockedRequests: atomic.LoadInt64(&tbl.stats.BlockedRequests),
+			StartTime:       tbl.stats.StartTime,
+			LimiterType:     TokenBucketType,
+		},
 		TotalClients:    atomic.LoadInt64(&tbl.stats.TotalClients),
 		ActiveClients:   activeClients,
-		TotalRequests:   atomic.LoadInt64(&tbl.stats.TotalRequests),
-		AllowedRequests: atomic.LoadInt64(&tbl.stats.AllowedRequests),
-		BlockedRequests: atomic.LoadInt64(&tbl.stats.BlockedRequests),
 		WaitedRequests:  atomic.LoadInt64(&tbl.stats.WaitedRequests),
 		TimeoutRequests: atomic.LoadInt64(&tbl.stats.TimeoutRequests),
 		TotalWaitTime:   atomic.LoadInt64(&tbl.stats.TotalWaitTime),
-		StartTime:       tbl.stats.StartTime,
 	}
 }
 
@@ -551,6 +555,15 @@ func (tbl *TokenBucketLimiter) ResetStats() {
 	atomic.StoreInt64(&tbl.stats.TimeoutRequests, 0)
 	atomic.StoreInt64(&tbl.stats.TotalWaitTime, 0)
 	tbl.stats.StartTime = time.Now()
+}
+
+func (tbl *TokenBucketLimiter) Type() RateLimiterType {
+	return TokenBucketType
+
+}
+
+func (tbl *TokenBucketLimiter) Algorithm() Algorithm {
+	return TokenBucketAlg
 }
 
 // =============================================================================

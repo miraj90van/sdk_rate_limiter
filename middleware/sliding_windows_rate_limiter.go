@@ -15,6 +15,9 @@ import (
 	"net/http"
 )
 
+// Ensure it implements RateLimiter interface
+var _ RateLimiter = (*SlidingWindowLimiter)(nil)
+
 // SlidingWindowConfig for sliding window rate limiting
 type SlidingWindowConfig struct {
 	Limit              int                       // Maximum requests allowed in the time window
@@ -64,12 +67,23 @@ type SlidingWindowLimiter struct {
 
 // SlidingWindowStats holds statistics about sliding window rate limiting
 type SlidingWindowStats struct {
-	TotalClients    int64
-	ActiveClients   int64
-	TotalRequests   int64
-	AllowedRequests int64
-	BlockedRequests int64
-	StartTime       time.Time
+	*BaseStats
+	TotalClients  int64
+	ActiveClients int64
+}
+
+func (s *SlidingWindowStats) Clone() Stats {
+	return &SlidingWindowStats{
+		BaseStats: &BaseStats{
+			StartTime:       s.StartTime,
+			LimiterType:     s.LimiterType,
+			TotalRequests:   atomic.LoadInt64(&s.TotalRequests),
+			AllowedRequests: atomic.LoadInt64(&s.AllowedRequests),
+			BlockedRequests: atomic.LoadInt64(&s.BlockedRequests),
+		},
+		TotalClients:  atomic.LoadInt64(&s.TotalClients),
+		ActiveClients: atomic.LoadInt64(&s.ActiveClients),
+	}
 }
 
 // NewSlidingWindowLimiter creates a new sliding window rate limiter
@@ -99,7 +113,10 @@ func NewSlidingWindowLimiter(config *SlidingWindowConfig) *SlidingWindowLimiter 
 		config:      config,
 		stopCleanup: make(chan struct{}),
 		stats: &SlidingWindowStats{
-			StartTime: time.Now(),
+			BaseStats: &BaseStats{
+				StartTime:   time.Now(),
+				LimiterType: SlidingWindowType,
+			},
 		},
 	}
 
@@ -216,11 +233,6 @@ func (swl *SlidingWindowLimiter) cleanup() {
 
 	// Update stats
 	atomic.StoreInt64(&swl.stats.ActiveClients, int64(len(swl.clients)))
-}
-
-// Stop stops the cleanup goroutine
-func (swl *SlidingWindowLimiter) Stop() {
-	close(swl.stopCleanup)
 }
 
 // getAllowedForClient checks if request is allowed for specific client and updates window
@@ -417,19 +429,9 @@ func (swl *SlidingWindowLimiter) Middleware() gin.HandlerFunc {
 }
 
 // GetStats returns sliding window statistics
-func (swl *SlidingWindowLimiter) GetStats() SlidingWindowStats {
-	swl.mu.RLock()
-	activeClients := int64(len(swl.clients))
-	swl.mu.RUnlock()
-
-	return SlidingWindowStats{
-		TotalClients:    atomic.LoadInt64(&swl.stats.TotalClients),
-		ActiveClients:   activeClients,
-		TotalRequests:   atomic.LoadInt64(&swl.stats.TotalRequests),
-		AllowedRequests: atomic.LoadInt64(&swl.stats.AllowedRequests),
-		BlockedRequests: atomic.LoadInt64(&swl.stats.BlockedRequests),
-		StartTime:       swl.stats.StartTime,
-	}
+func (swl *SlidingWindowLimiter) GetStats() Stats {
+	atomic.StoreInt64(&swl.stats.ActiveClients, int64(len(swl.clients)))
+	return swl.stats.Clone()
 }
 
 // GetClientStats returns current window statistics for a specific client
@@ -490,6 +492,18 @@ func (swl *SlidingWindowLimiter) ResetStats() {
 	atomic.StoreInt64(&swl.stats.AllowedRequests, 0)
 	atomic.StoreInt64(&swl.stats.BlockedRequests, 0)
 	swl.stats.StartTime = time.Now()
+}
+
+func (swl *SlidingWindowLimiter) Stop() {
+	close(swl.stopCleanup)
+}
+
+func (swl *SlidingWindowLimiter) Type() RateLimiterType {
+	return SlidingWindowType
+}
+
+func (swl *SlidingWindowLimiter) Algorithm() Algorithm {
+	return SlidingWindowAlg
 }
 
 // =============================================================================

@@ -30,12 +30,7 @@ type BasicRateLimiterConfig struct {
 // BasicRequestInfo contains info about request (for logging/monitoring only)
 // Note: IP is only for logging, NOT for rate limiting (global limiter doesn't care about IP)
 type BasicRequestInfo struct {
-	IP        string // For logging only
-	Path      string // For logging only
-	Method    string // For logging only
-	UserAgent string // For logging only
-	Timestamp time.Time
-	Allowed   bool
+	BaseRequestInfo
 }
 
 // BasicRateLimiter manages GLOBAL rate limiting (single limiter for all requests)
@@ -47,10 +42,7 @@ type BasicRateLimiter struct {
 
 // BasicStats for global rate limiting statistics
 type BasicStats struct {
-	TotalRequests   int64
-	AllowedRequests int64
-	BlockedRequests int64
-	StartTime       time.Time
+	*BaseStats
 }
 
 // NewBasicRateLimiter creates a new GLOBAL rate limiter
@@ -67,7 +59,10 @@ func NewBasicRateLimiter(config *BasicRateLimiterConfig) *BasicRateLimiter {
 		limiter: rate.NewLimiter(config.Rate, config.Burst), // Single limiter for ALL requests
 		config:  config,
 		stats: &BasicStats{
-			StartTime: time.Now(),
+			BaseStats: &BaseStats{
+				StartTime:   time.Now(),
+				LimiterType: BasicType,
+			},
 		},
 	}
 }
@@ -86,12 +81,14 @@ func DefaultBasicConfig() *BasicRateLimiterConfig {
 // createRequestInfo creates request info for logging/monitoring only
 func (brl *BasicRateLimiter) createRequestInfo(c *gin.Context, allowed bool) *BasicRequestInfo {
 	return &BasicRequestInfo{
-		IP:        c.ClientIP(), // Only for logging, not for limiting
-		Path:      c.Request.URL.Path,
-		Method:    c.Request.Method,
-		UserAgent: c.GetHeader("User-Agent"),
-		Timestamp: time.Now(),
-		Allowed:   allowed,
+		BaseRequestInfo: BaseRequestInfo{
+			IP:        c.ClientIP(),
+			Path:      c.Request.URL.Path,
+			Method:    c.Request.Method,
+			UserAgent: c.GetHeader("User-Agent"),
+			Timestamp: time.Now(),
+			Allowed:   allowed,
+		},
 	}
 }
 
@@ -195,21 +192,35 @@ func (brl *BasicRateLimiter) Middleware() gin.HandlerFunc {
 }
 
 // GetStats returns global rate limiting statistics
-func (brl *BasicRateLimiter) GetStats() BasicStats {
-	return BasicStats{
-		TotalRequests:   atomic.LoadInt64(&brl.stats.TotalRequests),
-		AllowedRequests: atomic.LoadInt64(&brl.stats.AllowedRequests),
-		BlockedRequests: atomic.LoadInt64(&brl.stats.BlockedRequests),
-		StartTime:       brl.stats.StartTime,
-	}
+func (brl *BasicRateLimiter) GetStats() Stats {
+	// Update live counters
+	brl.stats.TotalRequests = atomic.LoadInt64(&brl.stats.BaseStats.TotalRequests)
+	brl.stats.AllowedRequests = atomic.LoadInt64(&brl.stats.BaseStats.AllowedRequests)
+	brl.stats.BlockedRequests = atomic.LoadInt64(&brl.stats.BaseStats.BlockedRequests)
+	return brl.stats
 }
 
 // ResetStats resets global statistics
 func (brl *BasicRateLimiter) ResetStats() {
-	atomic.StoreInt64(&brl.stats.TotalRequests, 0)
-	atomic.StoreInt64(&brl.stats.AllowedRequests, 0)
-	atomic.StoreInt64(&brl.stats.BlockedRequests, 0)
-	brl.stats.StartTime = time.Now()
+	atomic.StoreInt64(&brl.stats.BaseStats.TotalRequests, 0)
+	atomic.StoreInt64(&brl.stats.BaseStats.AllowedRequests, 0)
+	atomic.StoreInt64(&brl.stats.BaseStats.BlockedRequests, 0)
+	brl.stats.BaseStats.StartTime = time.Now()
+}
+
+// Stop gracefully stops the rate limiter (not needed for Basic, but required by interface)
+func (brl *BasicRateLimiter) Stop() {
+	// No background cleanup needed for global limiter
+}
+
+// Type returns the type of rate limiter
+func (brl *BasicRateLimiter) Type() RateLimiterType {
+	return BasicType
+}
+
+// Algorithm returns the algorithm used (Token Bucket)
+func (brl *BasicRateLimiter) Algorithm() Algorithm {
+	return TokenBucketAlg
 }
 
 // =============================================================================

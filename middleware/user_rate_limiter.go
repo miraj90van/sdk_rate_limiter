@@ -16,6 +16,9 @@ import (
 	"net/http"
 )
 
+// Ensure it implements RateLimiter interface
+var _ RateLimiter = (*UserRateLimiter)(nil)
+
 // UserRateLimiterConfig for user-based rate limiting
 type UserRateLimiterConfig struct {
 	Rate               rate.Limit    // Requests per second PER USER
@@ -69,16 +72,21 @@ type UserRateLimiter struct {
 	stopCleanup   chan struct{}
 }
 
+func (url *UserRateLimiter) Type() RateLimiterType {
+	return UserType
+}
+
+func (url *UserRateLimiter) Algorithm() Algorithm {
+	return TokenBucketAlg
+}
+
 // UserStats holds statistics about user rate limiting
 type UserStats struct {
-	TotalUsers      int64
-	ActiveUsers     int64
-	AnonymousUsers  int64
-	TotalRequests   int64
-	AllowedRequests int64
-	BlockedRequests int64
-	UnauthRequests  int64 // Requests rejected due to missing auth
-	StartTime       time.Time
+	*BaseStats
+	TotalUsers     int64
+	ActiveUsers    int64
+	AnonymousUsers int64
+	UnauthRequests int64 // Requests rejected due to missing auth
 }
 
 // NewUserRateLimiter creates a new user-based rate limiter
@@ -109,7 +117,9 @@ func NewUserRateLimiter(config *UserRateLimiterConfig) *UserRateLimiter {
 		config:      config,
 		stopCleanup: make(chan struct{}),
 		stats: &UserStats{
-			StartTime: time.Now(),
+			BaseStats: &BaseStats{
+				StartTime: time.Now(),
+			},
 		},
 	}
 
@@ -519,20 +529,23 @@ func (url *UserRateLimiter) Middleware() gin.HandlerFunc {
 }
 
 // GetStats returns user rate limiting statistics
-func (url *UserRateLimiter) GetStats() UserStats {
+func (url *UserRateLimiter) GetStats() Stats {
 	url.mu.RLock()
 	activeUsers := int64(len(url.limiters))
 	url.mu.RUnlock()
 
 	return UserStats{
-		TotalUsers:      atomic.LoadInt64(&url.stats.TotalUsers),
-		ActiveUsers:     activeUsers,
-		AnonymousUsers:  atomic.LoadInt64(&url.stats.AnonymousUsers),
-		TotalRequests:   atomic.LoadInt64(&url.stats.TotalRequests),
-		AllowedRequests: atomic.LoadInt64(&url.stats.AllowedRequests),
-		BlockedRequests: atomic.LoadInt64(&url.stats.BlockedRequests),
-		UnauthRequests:  atomic.LoadInt64(&url.stats.UnauthRequests),
-		StartTime:       url.stats.StartTime,
+		BaseStats: &BaseStats{
+			TotalRequests:   atomic.LoadInt64(&url.stats.TotalRequests),
+			AllowedRequests: atomic.LoadInt64(&url.stats.AllowedRequests),
+			BlockedRequests: atomic.LoadInt64(&url.stats.BlockedRequests),
+			StartTime:       url.stats.StartTime,
+			LimiterType:     UserType,
+		},
+		TotalUsers:     atomic.LoadInt64(&url.stats.TotalUsers),
+		ActiveUsers:    activeUsers,
+		AnonymousUsers: atomic.LoadInt64(&url.stats.AnonymousUsers),
+		UnauthRequests: atomic.LoadInt64(&url.stats.UnauthRequests),
 	}
 }
 

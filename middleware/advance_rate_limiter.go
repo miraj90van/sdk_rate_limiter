@@ -16,6 +16,8 @@ import (
 	"net/http"
 )
 
+var _ RateLimiter = (*AdvancedRateLimiter)(nil)
+
 // AdvancedRateLimiterConfig for flexible per-client rate limiting
 type AdvancedRateLimiterConfig struct {
 	Rate               rate.Limit                // Requests per second PER CLIENT
@@ -69,12 +71,9 @@ type AdvancedRateLimiter struct {
 
 // AdvancedStats holds statistics about advanced rate limiting
 type AdvancedStats struct {
-	TotalClients    int64
-	ActiveClients   int64
-	TotalRequests   int64
-	AllowedRequests int64
-	BlockedRequests int64
-	StartTime       time.Time
+	*BaseStats
+	TotalClients  int64
+	ActiveClients int64
 }
 
 // NewAdvancedRateLimiter creates a new advanced rate limiter
@@ -108,8 +107,11 @@ func NewAdvancedRateLimiter(config *AdvancedRateLimiterConfig) *AdvancedRateLimi
 		limiters:    make(map[string]*AdvancedLimiterEntry),
 		config:      config,
 		stopCleanup: make(chan struct{}),
+
 		stats: &AdvancedStats{
-			StartTime: time.Now(),
+			BaseStats: &BaseStats{
+				StartTime: time.Now(),
+			},
 		},
 	}
 
@@ -441,18 +443,21 @@ func (arl *AdvancedRateLimiter) Middleware() gin.HandlerFunc {
 }
 
 // GetStats returns advanced rate limiting statistics
-func (arl *AdvancedRateLimiter) GetStats() AdvancedStats {
+func (arl *AdvancedRateLimiter) GetStats() Stats {
 	arl.mu.RLock()
 	activeClients := int64(len(arl.limiters))
 	arl.mu.RUnlock()
 
 	return AdvancedStats{
-		TotalClients:    atomic.LoadInt64(&arl.stats.TotalClients),
-		ActiveClients:   activeClients,
-		TotalRequests:   atomic.LoadInt64(&arl.stats.TotalRequests),
-		AllowedRequests: atomic.LoadInt64(&arl.stats.AllowedRequests),
-		BlockedRequests: atomic.LoadInt64(&arl.stats.BlockedRequests),
-		StartTime:       arl.stats.StartTime,
+		BaseStats: &BaseStats{
+			TotalRequests:   atomic.LoadInt64(&arl.stats.TotalRequests),
+			AllowedRequests: atomic.LoadInt64(&arl.stats.AllowedRequests),
+			BlockedRequests: atomic.LoadInt64(&arl.stats.BlockedRequests),
+			StartTime:       arl.stats.StartTime,
+			LimiterType:     AdvancedType,
+		},
+		TotalClients:  atomic.LoadInt64(&arl.stats.TotalClients),
+		ActiveClients: activeClients,
 	}
 }
 
@@ -550,6 +555,14 @@ func RegionBasedKeyExtractor(c *gin.Context) string {
 		return "region:" + region + ":ip:" + c.ClientIP()
 	}
 	return fmt.Sprintf("region:%s:user:%s", region, userID)
+}
+
+func (arl *AdvancedRateLimiter) Type() RateLimiterType {
+	return AdvancedType
+}
+
+func (arl *AdvancedRateLimiter) Algorithm() Algorithm {
+	return LeakyBucketAlg
 }
 
 // =============================================================================

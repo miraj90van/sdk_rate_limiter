@@ -551,9 +551,7 @@ func mlInferenceHandler(c *gin.Context) {
 }
 
 func printProductionInfo() {
-	fmt.Println("\n" + "="*70)
 	fmt.Println("🏭 RATE LIMITER SDK - PRODUCTION EXAMPLE")
-	fmt.Println("=" * 70)
 	fmt.Println()
 
 	fmt.Println("🛡️  LAYERED PROTECTION:")
@@ -621,5 +619,4 @@ func printProductionInfo() {
 	fmt.Println("# Load test example")
 	fmt.Println("for i in {1..100}; do curl -s http://localhost:8080/api/public/health & done")
 	fmt.Println()
-	fmt.Println("=" * 70)
 }

@@ -263,9 +263,7 @@ func premiumHandler(c *gin.Context) {
 }
 
 func printUsageInfo() {
-	fmt.Println("\n" + "="*60)
 	fmt.Println("🚀 RATE LIMITER SDK - BASIC EXAMPLES")
-	fmt.Println("=", *60)
 	fmt.Println()
 
 	fmt.Println("📋 Available endpoints:")
@@ -323,5 +321,4 @@ func printUsageInfo() {
 	fmt.Println("# View statistics")
 	fmt.Println("curl http://localhost:8080/stats")
 	fmt.Println()
-	fmt.Println("=" * 60)
 }
