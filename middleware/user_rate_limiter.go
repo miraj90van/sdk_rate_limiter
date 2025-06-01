@@ -1,4 +1,4 @@
-// user_rate_limiter_middleware.go
+// user_rate_limiter.go
 // Purpose: PER-USER rate limiting only - each user gets their own rate limit
 // Use case: Fair limiting per authenticated user, SaaS applications, user-facing APIs
 
