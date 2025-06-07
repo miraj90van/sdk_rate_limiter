@@ -28,6 +28,8 @@ const (
 	AdvancedType                             // Flexible custom key rate limiting
 	SlidingWindowType                        // Sliding window algorithm
 	TokenBucketType                          // Token bucket with waiting
+	FixedWindowType                          // Fixed window counter
+	LeakyBucketType                          // Leaky bucket algorithm
 )
 
 // String returns the string representation of RateLimiterType
