@@ -20,7 +20,6 @@ import (
 )
 
 var _ RateLimiter = (*LeakyBucketRateLimiter)(nil)
-var _ ClientAwareRateLimiter = (*LeakyBucketRateLimiter)(nil)
 
 // LeakyBucketConfig configuration for leaky bucket rate limiter
 type LeakyBucketConfig struct {
@@ -382,7 +381,7 @@ func (lbrl *LeakyBucketRateLimiter) setHeaders(c *gin.Context, currentLevel floa
 	c.Header("X-RateLimit-Reset", time.Now().Add(timeToEmpty).Format(time.RFC3339))
 	c.Header("X-RateLimit-Leak-Rate", fmt.Sprintf("%.2f/sec", lbrl.config.LeakRate))
 	c.Header("X-RateLimit-Bucket-Level", fmt.Sprintf("%.2f", currentLevel))
-	c.Header("X-RateLimit-Algorithm", "leaky-bucket")
+	c.Header("X-RateLimit-Algorithm", lbrl.Algorithm().String())
 
 	if lbrl.redisMode {
 		c.Header("X-RateLimit-Mode", "redis")
@@ -432,7 +431,7 @@ func (lbrl *LeakyBucketRateLimiter) handleLimitExceeded(c *gin.Context, info *Le
 		return
 	}
 
-	// Default error response
+	// Default error response:
 	response := gin.H{
 		"error":        lbrl.config.ErrorMessage,
 		"message":      "Bucket capacity exceeded",
@@ -441,7 +440,7 @@ func (lbrl *LeakyBucketRateLimiter) handleLimitExceeded(c *gin.Context, info *Le
 		"capacity":     info.Capacity,
 		"leak_rate":    fmt.Sprintf("%.2f req/sec", info.LeakRate),
 		"bucket_usage": fmt.Sprintf("%.1f%%", info.BucketUsage*100),
-		"algorithm":    "leaky-bucket",
+		"algorithm":    lbrl.Algorithm().String(),
 		"timestamp":    info.Timestamp.Format(time.RFC3339),
 	}
 
@@ -463,7 +462,7 @@ func (lbrl *LeakyBucketRateLimiter) handleQueuedRequest(c *gin.Context, info *Le
 
 	atomic.AddInt64(&lbrl.stats.QueuedRequests, 1)
 
-	// Wait for bucket to have space
+	// Wait for bucket to have space:
 	select {
 	case <-time.After(info.EstimatedWait):
 		// Try again after waiting
@@ -667,71 +666,4 @@ func (lbrl *LeakyBucketRateLimiter) Type() RateLimiterType {
 // Algorithm returns the algorithm used
 func (lbrl *LeakyBucketRateLimiter) Algorithm() Algorithm {
 	return LeakyBucketAlg
-}
-
-// =============================================================================
-// CONVENIENCE FUNCTIONS
-// =============================================================================
-
-// LeakyBucketMiddleware creates a simple leaky bucket rate limiter
-func LeakyBucketMiddleware(leakRate float64, capacity int, redisClient *redis.Client) gin.HandlerFunc {
-	config := &LeakyBucketConfig{
-		LeakRate:       leakRate,
-		Capacity:       capacity,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   IPKeyExtractor,
-	}
-	limiter := NewLeakyBucketRateLimiter(config)
-	return limiter.Middleware()
-}
-
-// LeakyBucketPerIPMiddleware creates a per-IP leaky bucket rate limiter
-func LeakyBucketPerIPMiddleware(leakRate float64, capacity int, redisClient *redis.Client) gin.HandlerFunc {
-	return LeakyBucketMiddleware(leakRate, capacity, redisClient)
-}
-
-// LeakyBucketPerUserMiddleware creates a per-user leaky bucket rate limiter
-func LeakyBucketPerUserMiddleware(leakRate float64, capacity int, redisClient *redis.Client) gin.HandlerFunc {
-	config := &LeakyBucketConfig{
-		LeakRate:       leakRate,
-		Capacity:       capacity,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   UserIDKeyExtractor,
-	}
-	limiter := NewLeakyBucketRateLimiter(config)
-	return limiter.Middleware()
-}
-
-// LeakyBucketPerAPIKeyMiddleware creates a per-API-key leaky bucket rate limiter
-func LeakyBucketPerAPIKeyMiddleware(leakRate float64, capacity int, redisClient *redis.Client) gin.HandlerFunc {
-	config := &LeakyBucketConfig{
-		LeakRate:       leakRate,
-		Capacity:       capacity,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   APIKeyExtractor,
-	}
-	limiter := NewLeakyBucketRateLimiter(config)
-	return limiter.Middleware()
-}
-
-// LeakyBucketWithQueueingMiddleware creates a leaky bucket limiter that allows queueing
-func LeakyBucketWithQueueingMiddleware(leakRate float64, capacity int, maxQueueTime time.Duration, redisClient *redis.Client) gin.HandlerFunc {
-	config := &LeakyBucketConfig{
-		LeakRate:       leakRate,
-		Capacity:       capacity,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   IPKeyExtractor,
-		AllowQueueing:  true,
-		MaxQueueTime:   maxQueueTime,
-	}
-	limiter := NewLeakyBucketRateLimiter(config)
-	return limiter.Middleware()
 }

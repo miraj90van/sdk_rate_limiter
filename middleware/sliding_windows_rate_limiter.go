@@ -19,7 +19,6 @@ import (
 )
 
 var _ RateLimiter = (*SlidingWindowRateLimiter)(nil)
-var _ ClientAwareRateLimiter = (*SlidingWindowRateLimiter)(nil)
 
 // SlidingWindowConfig configuration for sliding window rate limiter
 type SlidingWindowConfig struct {
@@ -28,7 +27,7 @@ type SlidingWindowConfig struct {
 	RedisClient        *redis.Client // Redis client for distributed limiting
 	RedisKeyPrefix     string        // Prefix for Redis keys
 	EnableFallback     bool          // Enable fallback to in-memory when Redis fails
-	KeyExtractor       KeyExtractor  // Function to extract client key
+	KeyExtractor       KeyExtractor  // Function to extract a client key
 	MaxClients         int           // Maximum clients to track (fallback mode)
 	CleanupInterval    time.Duration // Cleanup interval (fallback mode)
 	ClientTTL          time.Duration // Client TTL (fallback mode)
@@ -346,7 +345,7 @@ func (swrl *SlidingWindowRateLimiter) setHeaders(c *gin.Context, remaining int, 
 	c.Header("X-RateLimit-Remaining", strconv.Itoa(remaining))
 	c.Header("X-RateLimit-Reset", windowEnd.Add(swrl.config.WindowSize).Format(time.RFC3339))
 	c.Header("X-RateLimit-Window", swrl.config.WindowSize.String())
-	c.Header("X-RateLimit-Algorithm", "sliding-window")
+	c.Header("X-RateLimit-Algorithm", swrl.Algorithm().String())
 
 	if swrl.redisMode {
 		c.Header("X-RateLimit-Mode", "redis")
@@ -403,7 +402,7 @@ func (swrl *SlidingWindowRateLimiter) handleLimitExceeded(c *gin.Context, info *
 		"message":     fmt.Sprintf("Rate limit exceeded: %d requests in %v window", info.RequestsInWindow, swrl.config.WindowSize),
 		"client":      info.ClientKey,
 		"window":      swrl.config.WindowSize.String(),
-		"algorithm":   "sliding-window",
+		"algorithm":   swrl.Algorithm().String(),
 		"timestamp":   info.Timestamp.Format(time.RFC3339),
 		"retry_after": retryAfter.Seconds(),
 	})
@@ -439,7 +438,7 @@ func (swrl *SlidingWindowRateLimiter) updateClientStats(clientKey string, allowe
 // Middleware returns the sliding window rate limiting middleware
 func (swrl *SlidingWindowRateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Extract client key
+		// Extract a client key
 		clientKey := swrl.config.KeyExtractor(c)
 		if clientKey == "" {
 			clientKey = c.ClientIP() // Fallback to IP
@@ -594,55 +593,4 @@ func (swrl *SlidingWindowRateLimiter) Type() RateLimiterType {
 // Algorithm returns the algorithm used
 func (swrl *SlidingWindowRateLimiter) Algorithm() Algorithm {
 	return SlidingWindowAlg
-}
-
-// =============================================================================
-// CONVENIENCE FUNCTIONS
-// =============================================================================
-
-// SlidingWindowMiddleware creates a simple sliding window rate limiter
-func SlidingWindowMiddleware(requestsPerWindow int, windowSize time.Duration, redisClient *redis.Client) gin.HandlerFunc {
-	config := &SlidingWindowConfig{
-		Rate:           requestsPerWindow,
-		WindowSize:     windowSize,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   IPKeyExtractor,
-	}
-	limiter := NewSlidingWindowRateLimiter(config)
-	return limiter.Middleware()
-}
-
-// SlidingWindowPerIPMiddleware creates a per-IP sliding window rate limiter
-func SlidingWindowPerIPMiddleware(requestsPerWindow int, windowSize time.Duration, redisClient *redis.Client) gin.HandlerFunc {
-	return SlidingWindowMiddleware(requestsPerWindow, windowSize, redisClient)
-}
-
-// SlidingWindowPerUserMiddleware creates a per-user sliding window rate limiter
-func SlidingWindowPerUserMiddleware(requestsPerWindow int, windowSize time.Duration, redisClient *redis.Client) gin.HandlerFunc {
-	config := &SlidingWindowConfig{
-		Rate:           requestsPerWindow,
-		WindowSize:     windowSize,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   UserIDKeyExtractor,
-	}
-	limiter := NewSlidingWindowRateLimiter(config)
-	return limiter.Middleware()
-}
-
-// SlidingWindowPerAPIKeyMiddleware creates a per-API-key sliding window rate limiter
-func SlidingWindowPerAPIKeyMiddleware(requestsPerWindow int, windowSize time.Duration, redisClient *redis.Client) gin.HandlerFunc {
-	config := &SlidingWindowConfig{
-		Rate:           requestsPerWindow,
-		WindowSize:     windowSize,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   APIKeyExtractor,
-	}
-	limiter := NewSlidingWindowRateLimiter(config)
-	return limiter.Middleware()
 }

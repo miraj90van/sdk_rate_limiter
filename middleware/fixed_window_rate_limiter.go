@@ -19,7 +19,6 @@ import (
 )
 
 var _ RateLimiter = (*FixedWindowRateLimiter)(nil)
-var _ ClientAwareRateLimiter = (*FixedWindowRateLimiter)(nil)
 
 // FixedWindowConfig configuration for fixed window rate limiter
 type FixedWindowConfig struct {
@@ -28,7 +27,7 @@ type FixedWindowConfig struct {
 	RedisClient        *redis.Client // Redis client for distributed limiting
 	RedisKeyPrefix     string        // Prefix for Redis keys
 	EnableFallback     bool          // Enable fallback to in-memory when Redis fails
-	KeyExtractor       KeyExtractor  // Function to extract client key
+	KeyExtractor       KeyExtractor  // Function to extract a client key
 	MaxClients         int           // Maximum clients to track (fallback mode)
 	CleanupInterval    time.Duration // Cleanup interval (fallback mode)
 	ClientTTL          time.Duration // Client TTL (fallback mode)
@@ -49,7 +48,7 @@ type FixedWindowRequestInfo struct {
 	WindowNumber     int64         `json:"window_number"` // Window identifier
 	RequestsInWindow int           `json:"requests_in_window"`
 	WindowUsage      float64       `json:"window_usage"`  // 0.0 to 1.0
-	TimeToReset      time.Duration `json:"time_to_reset"` // Time until window resets
+	TimeToReset      time.Duration `json:"time_to_reset"` // Time until a window resets
 }
 
 // FixedWindowStats statistics for fixed window rate limiter
@@ -362,7 +361,7 @@ func (fwrl *FixedWindowRateLimiter) setHeaders(c *gin.Context, remaining int, re
 	c.Header("X-RateLimit-Remaining", strconv.Itoa(remaining))
 	c.Header("X-RateLimit-Reset", resetTime.Format(time.RFC3339))
 	c.Header("X-RateLimit-Window", fwrl.config.WindowSize.String())
-	c.Header("X-RateLimit-Algorithm", "fixed-window")
+	c.Header("X-RateLimit-Algorithm", fwrl.Algorithm().String())
 
 	if fwrl.redisMode {
 		c.Header("X-RateLimit-Mode", "redis")
@@ -421,7 +420,7 @@ func (fwrl *FixedWindowRateLimiter) handleLimitExceeded(c *gin.Context, info *Fi
 		"window_size":   fwrl.config.WindowSize.String(),
 		"reset_time":    info.WindowEnd.Format(time.RFC3339),
 		"time_to_reset": info.TimeToReset.Seconds(),
-		"algorithm":     "fixed-window",
+		"algorithm":     fwrl.Algorithm().String(),
 		"timestamp":     info.Timestamp.Format(time.RFC3339),
 	})
 	c.Abort()
@@ -456,7 +455,7 @@ func (fwrl *FixedWindowRateLimiter) updateClientStats(clientKey string, allowed 
 // Middleware returns the fixed window rate limiting middleware
 func (fwrl *FixedWindowRateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Extract client key
+		// Extract a client key
 		clientKey := fwrl.config.KeyExtractor(c)
 		if clientKey == "" {
 			clientKey = c.ClientIP() // Fallback to IP
@@ -618,55 +617,4 @@ func (fwrl *FixedWindowRateLimiter) Type() RateLimiterType {
 // Algorithm returns the algorithm used
 func (fwrl *FixedWindowRateLimiter) Algorithm() Algorithm {
 	return FixedWindowAlg
-}
-
-// =============================================================================
-// CONVENIENCE FUNCTIONS
-// =============================================================================
-
-// FixedWindowMiddleware creates a simple fixed window rate limiter
-func FixedWindowMiddleware(requestsPerWindow int, windowSize time.Duration, redisClient *redis.Client) gin.HandlerFunc {
-	config := &FixedWindowConfig{
-		Rate:           requestsPerWindow,
-		WindowSize:     windowSize,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   IPKeyExtractor,
-	}
-	limiter := NewFixedWindowRateLimiter(config)
-	return limiter.Middleware()
-}
-
-// FixedWindowPerIPMiddleware creates a per-IP fixed window rate limiter
-func FixedWindowPerIPMiddleware(requestsPerWindow int, windowSize time.Duration, redisClient *redis.Client) gin.HandlerFunc {
-	return FixedWindowMiddleware(requestsPerWindow, windowSize, redisClient)
-}
-
-// FixedWindowPerUserMiddleware creates a per-user fixed window rate limiter
-func FixedWindowPerUserMiddleware(requestsPerWindow int, windowSize time.Duration, redisClient *redis.Client) gin.HandlerFunc {
-	config := &FixedWindowConfig{
-		Rate:           requestsPerWindow,
-		WindowSize:     windowSize,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   UserIDKeyExtractor,
-	}
-	limiter := NewFixedWindowRateLimiter(config)
-	return limiter.Middleware()
-}
-
-// FixedWindowPerAPIKeyMiddleware creates a per-API-key fixed window rate limiter
-func FixedWindowPerAPIKeyMiddleware(requestsPerWindow int, windowSize time.Duration, redisClient *redis.Client) gin.HandlerFunc {
-	config := &FixedWindowConfig{
-		Rate:           requestsPerWindow,
-		WindowSize:     windowSize,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   APIKeyExtractor,
-	}
-	limiter := NewFixedWindowRateLimiter(config)
-	return limiter.Middleware()
 }

@@ -22,7 +22,6 @@ import (
 )
 
 var _ RateLimiter = (*TokenBucketRateLimiter)(nil)
-var _ ClientAwareRateLimiter = (*TokenBucketRateLimiter)(nil)
 
 // TokenBucketConfig configuration for token bucket rate limiter
 type TokenBucketConfig struct {
@@ -32,7 +31,7 @@ type TokenBucketConfig struct {
 	RedisConfig        *component.RedisConfig // Redis configuration
 	RedisKeyPrefix     string                 // Prefix for Redis keys
 	EnableFallback     bool                   // Enable fallback to in-memory when Redis fails
-	KeyExtractor       KeyExtractor           // Function to extract client key
+	KeyExtractor       KeyExtractor           // Function to extract a client key
 	MaxClients         int                    // Maximum clients to track (fallback mode)
 	CleanupInterval    time.Duration          // Cleanup interval (fallback mode)
 	ClientTTL          time.Duration          // Client TTL (fallback mode)
@@ -359,7 +358,7 @@ func (tbrl *TokenBucketRateLimiter) setHeaders(c *gin.Context, tokensRemaining f
 	c.Header("X-RateLimit-Remaining", strconv.Itoa(int(math.Floor(tokensRemaining))))
 	c.Header("X-RateLimit-Reset", time.Now().Add(time.Duration(float64(time.Second)/float64(tbrl.config.Rate))).Format(time.RFC3339))
 	c.Header("X-RateLimit-Refill-Rate", fmt.Sprintf("%.2f/sec", float64(tbrl.config.Rate)))
-	c.Header("X-RateLimit-Algorithm", "token-bucket")
+	c.Header("X-RateLimit-Algorithm", tbrl.Algorithm().String())
 
 	if retryAfter > 0 {
 		SetRetryAfterHeader(c, retryAfter)
@@ -421,7 +420,7 @@ func (tbrl *TokenBucketRateLimiter) handleLimitExceeded(c *gin.Context, info *To
 		"tokens_used":     info.TokensUsed,
 		"bucket_capacity": info.BucketCapacity,
 		"refill_rate":     fmt.Sprintf("%.2f tokens/sec", info.RefillRate),
-		"algorithm":       "token-bucket",
+		"algorithm":       tbrl.Algorithm().String(),
 		"timestamp":       info.Timestamp.Format(time.RFC3339),
 	}
 
@@ -481,7 +480,7 @@ func (tbrl *TokenBucketRateLimiter) updateClientStats(clientKey string, allowed 
 // Middleware returns the token bucket rate limiting middleware
 func (tbrl *TokenBucketRateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Extract client key
+		// Extract a client key
 		clientKey := tbrl.config.KeyExtractor(c)
 		if clientKey == "" {
 			clientKey = c.ClientIP() // Fallback to IP
@@ -658,71 +657,4 @@ func (tbrl *TokenBucketRateLimiter) Type() RateLimiterType {
 // Algorithm returns the algorithm used
 func (tbrl *TokenBucketRateLimiter) Algorithm() Algorithm {
 	return TokenBucketAlg
-}
-
-// =============================================================================
-// CONVENIENCE FUNCTIONS
-// =============================================================================
-
-// TokenBucketMiddleware creates a simple token bucket rate limiter
-func TokenBucketMiddleware(rate rate.Limit, burst int, redisClient *redis.Client) gin.HandlerFunc {
-	config := &TokenBucketConfig{
-		Rate:           rate,
-		Burst:          burst,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   IPKeyExtractor,
-	}
-	limiter := NewTokenBucketRateLimiter(config)
-	return limiter.Middleware()
-}
-
-// TokenBucketPerIPMiddleware creates a per-IP token bucket rate limiter
-func TokenBucketPerIPMiddleware(rate rate.Limit, burst int, redisClient *redis.Client) gin.HandlerFunc {
-	return TokenBucketMiddleware(rate, burst, redisClient)
-}
-
-// TokenBucketPerUserMiddleware creates a per-user token bucket rate limiter
-func TokenBucketPerUserMiddleware(rate rate.Limit, burst int, redisClient *redis.Client) gin.HandlerFunc {
-	config := &TokenBucketConfig{
-		Rate:           rate,
-		Burst:          burst,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   UserIDKeyExtractor,
-	}
-	limiter := NewTokenBucketRateLimiter(config)
-	return limiter.Middleware()
-}
-
-// TokenBucketPerAPIKeyMiddleware creates a per-API-key token bucket rate limiter
-func TokenBucketPerAPIKeyMiddleware(rate rate.Limit, burst int, redisClient *redis.Client) gin.HandlerFunc {
-	config := &TokenBucketConfig{
-		Rate:           rate,
-		Burst:          burst,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   APIKeyExtractor,
-	}
-	limiter := NewTokenBucketRateLimiter(config)
-	return limiter.Middleware()
-}
-
-// TokenBucketWithWaitingMiddleware creates a token bucket limiter that allows waiting for tokens
-func TokenBucketWithWaitingMiddleware(rate rate.Limit, burst int, maxWaitTime time.Duration, redisClient *redis.Client) gin.HandlerFunc {
-	config := &TokenBucketConfig{
-		Rate:           rate,
-		Burst:          burst,
-		RedisClient:    redisClient,
-		EnableFallback: true,
-		EnableHeaders:  true,
-		KeyExtractor:   IPKeyExtractor,
-		AllowWaiting:   true,
-		MaxWaitTime:    maxWaitTime,
-	}
-	limiter := NewTokenBucketRateLimiter(config)
-	return limiter.Middleware()
 }
