@@ -18,10 +18,6 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// =============================================================================
-// TEST SUITE SETUP
-// =============================================================================
-
 type RateLimiterTestSuite struct {
 	suite.Suite
 	redisClient *redis.Client
@@ -58,10 +54,6 @@ func (suite *RateLimiterTestSuite) TearDownSuite() {
 func TestRateLimiterSuite(t *testing.T) {
 	suite.Run(t, new(RateLimiterTestSuite))
 }
-
-// =============================================================================
-// UNIT TESTS
-// =============================================================================
 
 func TestBasicRateLimiter_Configuration(t *testing.T) {
 	tests := []struct {
@@ -128,10 +120,6 @@ func TestTokenBucketRateLimiter_BasicFunctionality(t *testing.T) {
 	assert.Equal(t, int64(0), stats.GetTotalRequests())
 }
 
-// =============================================================================
-// CONCURRENCY TESTS
-// =============================================================================
-
 func TestTokenBucketRateLimiter_Concurrency(t *testing.T) {
 	config := &middleware.TokenBucketConfig{
 		Rate:           rate.Limit(1000), // 1000 req/sec
@@ -183,10 +171,6 @@ func TestTokenBucketRateLimiter_Concurrency(t *testing.T) {
 	assert.True(t, successCount <= totalRequests, "Success count should not exceed total")
 }
 
-// =============================================================================
-// PERFORMANCE BENCHMARKS
-// =============================================================================
-
 func BenchmarkBasicRateLimiter_Allow(b *testing.B) {
 	limiter := middleware.NewBasicRateLimiter(&middleware.BasicRateLimiterConfig{
 		Rate:  rate.Limit(1000000), // Very high limit
@@ -232,10 +216,6 @@ func BenchmarkTokenBucketRateLimiter_Memory(b *testing.B) {
 	})
 }
 
-// =============================================================================
-// INTEGRATION TESTS
-// =============================================================================
-
 func (suite *RateLimiterTestSuite) TestMultipleLimiters_Integration() {
 	// Global limiter: 1000 req/sec
 	globalLimiter := middleware.NewBasicRateLimiter(&middleware.BasicRateLimiterConfig{
@@ -278,10 +258,6 @@ func (suite *RateLimiterTestSuite) TestMultipleLimiters_Integration() {
 		}
 	}
 }
-
-// =============================================================================
-// LOAD TESTS
-// =============================================================================
 
 func TestRateLimiter_LoadTest(t *testing.T) {
 	if testing.Short() {
@@ -356,10 +332,6 @@ func TestRateLimiter_LoadTest(t *testing.T) {
 	assert.True(t, totalSuccess > 0, "Some requests should succeed")
 }
 
-// =============================================================================
-// REDIS FAILOVER TESTS
-// =============================================================================
-
 func (suite *RateLimiterTestSuite) TestRedisFailover() {
 	config := &middleware.TokenBucketConfig{
 		Rate:           rate.Limit(10),
@@ -394,10 +366,6 @@ func (suite *RateLimiterTestSuite) TestRedisFailover() {
 	// Should still work due to fallback
 	assert.Equal(suite.T(), http.StatusOK, w.Code)
 }
-
-// =============================================================================
-// MEMORY LEAK TESTS
-// =============================================================================
 
 func TestRateLimiter_MemoryCleanup(t *testing.T) {
 	config := &middleware.TokenBucketConfig{
@@ -434,10 +402,6 @@ func TestRateLimiter_MemoryCleanup(t *testing.T) {
 	assert.True(t, finalCount < initialCount, "Client count should decrease after cleanup")
 }
 
-// =============================================================================
-// HELPER FUNCTIONS
-// =============================================================================
-
 func createTestGinContext(method, path, remoteAddr string) (*gin.Context, *httptest.ResponseRecorder) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
@@ -451,10 +415,6 @@ func assertRateLimitHeaders(t *testing.T, w *httptest.ResponseRecorder) {
 	assert.NotEmpty(t, w.Header().Get("X-RateLimit-Limit"), "Should have rate limit header")
 	assert.NotEmpty(t, w.Header().Get("X-RateLimit-Remaining"), "Should have remaining header")
 }
-
-// =============================================================================
-// TABLE-DRIVEN TESTS
-// =============================================================================
 
 func TestAllRateLimiters_BasicFunctionality(t *testing.T) {
 	testCases := []struct {
