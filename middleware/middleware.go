@@ -23,11 +23,10 @@ type RateLimiterType int
 
 const (
 	BasicType         RateLimiterType = iota // Global rate limiting
-	IPType                                   // Per-IP rate limiting
-	UserType                                 // Per-user rate limiting
-	AdvancedType                             // Flexible custom key rate limiting
 	SlidingWindowType                        // Sliding window algorithm
 	TokenBucketType                          // Token bucket with waiting
+	FixedWindowType                          // Fixed window counter
+	LeakyBucketType                          // Leaky bucket algorithm
 )
 
 // String returns the string representation of RateLimiterType
@@ -35,16 +34,14 @@ func (r RateLimiterType) String() string {
 	switch r {
 	case BasicType:
 		return "basic"
-	case IPType:
-		return "ip"
-	case UserType:
-		return "user"
-	case AdvancedType:
-		return "advanced"
 	case SlidingWindowType:
 		return "sliding-window"
 	case TokenBucketType:
 		return "token-bucket"
+	case FixedWindowType:
+		return "fixed-window"
+	case LeakyBucketType:
+		return "leaky-bucket"
 	default:
 		return "unknown"
 	}
@@ -101,34 +98,6 @@ type RateLimiter interface {
 	Algorithm() Algorithm
 }
 
-// ConfigurableRateLimiter extends RateLimiter with configuration capabilities
-type ConfigurableRateLimiter interface {
-	RateLimiter
-
-	// UpdateConfig updates the rate limiter configuration dynamically
-	UpdateConfig(config interface{}) error
-
-	// GetConfig returns the current configuration
-	GetConfig() interface{}
-}
-
-// ClientAwareRateLimiter extends RateLimiter for per-client rate limiters
-type ClientAwareRateLimiter interface {
-	RateLimiter
-
-	// GetClientStats returns statistics for a specific client
-	GetClientStats(clientKey string) ClientStats
-
-	// ResetClient resets rate limiting for a specific client
-	ResetClient(clientKey string)
-
-	// ListActiveClients returns a list of currently active clients
-	ListActiveClients() []string
-
-	// GetClientCount returns the number of active clients
-	GetClientCount() int
-}
-
 // =============================================================================
 // COMMON TYPES & STRUCTS
 // =============================================================================
@@ -166,17 +135,12 @@ type BaseStats struct {
 	LimiterType     RateLimiterType `json:"limiter_type"`
 }
 
-// Implement Stats interface
 func (s *BaseStats) GetTotalRequests() int64   { return s.TotalRequests }
 func (s *BaseStats) GetAllowedRequests() int64 { return s.AllowedRequests }
 func (s *BaseStats) GetBlockedRequests() int64 { return s.BlockedRequests }
 func (s *BaseStats) GetStartTime() time.Time   { return s.StartTime }
 func (s *BaseStats) GetType() RateLimiterType  { return s.LimiterType }
-
-func (s *BaseStats) GetUptime() time.Duration {
-	return time.Since(s.StartTime)
-}
-
+func (s *BaseStats) GetUptime() time.Duration  { return time.Since(s.StartTime) }
 func (s *BaseStats) GetSuccessRate() float64 {
 	if s.TotalRequests == 0 {
 		return 1.0
@@ -264,9 +228,6 @@ var (
 	ErrInvalidMaxClients      = NewRateLimiterError("INVALID_MAX_CLIENTS", "invalid max_clients: must be greater than 0")
 	ErrInvalidCleanupInterval = NewRateLimiterError("INVALID_CLEANUP_INTERVAL", "invalid cleanup_interval: must be greater than 0")
 	ErrInvalidClientTTL       = NewRateLimiterError("INVALID_CLIENT_TTL", "invalid client_ttl: must be greater than 0")
-	ErrClientNotFound         = NewRateLimiterError("CLIENT_NOT_FOUND", "client not found")
-	ErrRateLimiterStopped     = NewRateLimiterError("RATE_LIMITER_STOPPED", "rate limiter has been stopped")
-	ErrInvalidConfig          = NewRateLimiterError("INVALID_CONFIG", "invalid configuration provided")
 )
 
 // RateLimiterError represents an error from the rate limiter
@@ -493,20 +454,12 @@ func (mr *MiddlewareRegistry) Stop() {
 // GLOBAL REGISTRY INSTANCE
 // =============================================================================
 
-// GlobalRegistry is the global registry instance that can be used throughout the application
-var GlobalRegistry = NewMiddlewareRegistry()
+// RateLimitRegistry is the global registry instance that can be used throughout the application
+var RateLimitRegistry = NewMiddlewareRegistry()
 
 // =============================================================================
 // UTILITY HELPER FUNCTIONS
 // =============================================================================
-
-// SetRateLimitHeaders sets standard rate limit headers
-func SetRateLimitHeaders(c *gin.Context, limit, remaining int, resetTime time.Time, scope string) {
-	c.Header("X-RateLimit-Limit", fmt.Sprintf("%d", limit))
-	c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
-	c.Header("X-RateLimit-Reset", resetTime.Format(time.RFC3339))
-	c.Header("X-RateLimit-Scope", scope)
-}
 
 // SetRetryAfterHeader sets the Retry-After header
 func SetRetryAfterHeader(c *gin.Context, retryAfter time.Duration) {
@@ -529,64 +482,4 @@ func EstimateRemainingFromReservation(limiter *rate.Limiter, burst int) int {
 	}
 
 	return 0
-}
-
-// CreateStandardErrorResponse creates a standard error response for rate limiting
-func CreateStandardErrorResponse(message, scope string, info RequestInfo) map[string]interface{} {
-	return map[string]interface{}{
-		"error":     message,
-		"scope":     scope,
-		"timestamp": info.GetTimestamp().Format(time.RFC3339),
-		"path":      info.GetPath(),
-		"method":    info.GetMethod(),
-	}
-}
-
-// =============================================================================
-// CONFIGURATION VALIDATION HELPERS
-// =============================================================================
-
-// ValidateCommonConfig validates common configuration parameters
-func ValidateCommonConfig(rate rate.Limit, burst int) error {
-	if rate <= 0 {
-		return ErrInvalidRate
-	}
-	if burst <= 0 {
-		return ErrInvalidBurst
-	}
-	return nil
-}
-
-// ValidateClientAwareConfig validates client-aware configuration parameters
-func ValidateClientAwareConfig(maxClients int, cleanupInterval, clientTTL time.Duration) error {
-	if maxClients <= 0 {
-		return ErrInvalidMaxClients
-	}
-	if cleanupInterval <= 0 {
-		return ErrInvalidCleanupInterval
-	}
-	if clientTTL <= 0 {
-		return ErrInvalidClientTTL
-	}
-	return nil
-}
-
-// =============================================================================
-// MONITORING HELPERS
-// =============================================================================
-
-// MetricsSnapshot represents a point-in-time snapshot of rate limiter metrics
-type MetricsSnapshot struct {
-	Timestamp       time.Time              `json:"timestamp"`
-	RegistryStats   map[string]interface{} `json:"registry_stats"`
-	IndividualStats map[string]Stats       `json:"individual_stats"`
-}
-
-// TakeMetricsSnapshot captures current metrics from all registered rate limiters
-func TakeMetricsSnapshot() *MetricsSnapshot {
-	return &MetricsSnapshot{
-		Timestamp:       time.Now(),
-		RegistryStats:   GlobalRegistry.GetSummaryStats(),
-		IndividualStats: GlobalRegistry.GetAllStats(),
-	}
 }

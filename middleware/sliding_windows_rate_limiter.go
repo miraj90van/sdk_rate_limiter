@@ -1,10 +1,12 @@
-// sliding_windows_rate_limiter_middleware.go
-// Purpose: SLIDING WINDOW rate limiting algorithm - more precise time-based limiting
-// Use case: When you need precise time-window based limiting (e.g., exactly 100 requests per minute)
+// sliding_window_rate_limiter.go
+// Purpose: Sliding window rate limiting with Redis support and fallback
+// Use case: Precise rate limiting with smooth distribution over time windows
 
 package middleware
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"strconv"
 	"sync"
@@ -12,335 +14,349 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"net/http"
 )
 
-// Ensure it implements RateLimiter interface
-var _ RateLimiter = (*SlidingWindowLimiter)(nil)
+var _ RateLimiter = (*SlidingWindowRateLimiter)(nil)
 
-// SlidingWindowConfig for sliding window rate limiting
+// SlidingWindowConfig configuration for sliding window rate limiter
 type SlidingWindowConfig struct {
-	Limit              int                       // Maximum requests allowed in the time window
-	Window             time.Duration             // Time window duration (e.g., 1 minute, 1 hour)
-	MaxClients         int                       // Maximum number of clients to track
-	CleanupInterval    time.Duration             // How often to cleanup old client entries
-	EnableHeaders      bool                      // Include rate limit headers
-	EnableLogging      bool                      // Enable logging
-	ClientKeyFunc      func(*gin.Context) string // Function to extract client key
-	ErrorMessage       string                    // Custom error message
-	ErrorResponse      interface{}               // Custom error response structure
+	Rate               int           // Requests per window
+	WindowSize         time.Duration // Window duration (e.g., 1 minute, 1 hour)
+	RedisClient        *redis.Client // Redis client for distributed limiting
+	RedisKeyPrefix     string        // Prefix for Redis keys
+	EnableFallback     bool          // Enable fallback to in-memory when Redis fails
+	KeyExtractor       KeyExtractor  // Function to extract a client key
+	MaxClients         int           // Maximum clients to track (fallback mode)
+	CleanupInterval    time.Duration // Cleanup interval (fallback mode)
+	ClientTTL          time.Duration // Client TTL (fallback mode)
+	EnableHeaders      bool          // Include rate limit headers
+	EnableLogging      bool          // Enable logging
+	ErrorMessage       string        // Custom error message
+	ErrorResponse      interface{}   // Custom error response structure
 	OnLimitExceeded    func(*gin.Context, *SlidingWindowRequestInfo)
 	OnRequestProcessed func(*gin.Context, *SlidingWindowRequestInfo, bool)
 }
 
-// SlidingWindowRequestInfo contains information about sliding window request
+// SlidingWindowRequestInfo contains request information for sliding window limiter
 type SlidingWindowRequestInfo struct {
-	ClientKey    string
-	IP           string
-	Path         string
-	Method       string
-	Timestamp    time.Time
-	Allowed      bool
-	CurrentCount int           // Current requests in window
-	Limit        int           // Limit for the window
-	WindowStart  time.Time     // Start of current window
-	WindowEnd    time.Time     // End of current window
-	RetryAfter   time.Duration // Time until window resets
+	BaseRequestInfo
+	ClientKey        string    `json:"client_key"`
+	WindowStart      time.Time `json:"window_start"`
+	WindowEnd        time.Time `json:"window_end"`
+	RequestsInWindow int       `json:"requests_in_window"`
+	WindowUsage      float64   `json:"window_usage"` // 0.0 to 1.0
 }
 
-// ClientWindowEntry represents sliding window data for a specific client
-type ClientWindowEntry struct {
-	requests   []time.Time  // Timestamps of requests in current window
-	lastAccess time.Time    // Last access time for cleanup
-	mu         sync.RWMutex // Mutex for thread-safe access to requests slice
-}
-
-// SlidingWindowLimiter manages sliding window rate limiting
-type SlidingWindowLimiter struct {
-	clients       map[string]*ClientWindowEntry
-	mu            sync.RWMutex
-	config        *SlidingWindowConfig
-	stats         *SlidingWindowStats
-	cleanupTicker *time.Ticker
-	stopCleanup   chan struct{}
-}
-
-// SlidingWindowStats holds statistics about sliding window rate limiting
+// SlidingWindowStats statistics for sliding window rate limiter
 type SlidingWindowStats struct {
 	*BaseStats
-	TotalClients  int64
-	ActiveClients int64
+	ActiveClients int64                   `json:"active_clients"`
+	RedisMode     bool                    `json:"redis_mode"`
+	FallbackMode  bool                    `json:"fallback_mode"`
+	RedisErrors   int64                   `json:"redis_errors"`
+	ClientStats   map[string]*ClientStats `json:"client_stats"`
+	mutex         sync.RWMutex
 }
 
-func (s *SlidingWindowStats) Clone() Stats {
-	return &SlidingWindowStats{
-		BaseStats: &BaseStats{
-			StartTime:       s.StartTime,
-			LimiterType:     s.LimiterType,
-			TotalRequests:   atomic.LoadInt64(&s.TotalRequests),
-			AllowedRequests: atomic.LoadInt64(&s.AllowedRequests),
-			BlockedRequests: atomic.LoadInt64(&s.BlockedRequests),
-		},
-		TotalClients:  atomic.LoadInt64(&s.TotalClients),
-		ActiveClients: atomic.LoadInt64(&s.ActiveClients),
-	}
+// clientEntry represents a client's rate limiting data in fallback mode
+type clientEntry struct {
+	timestamps []time.Time
+	lastAccess time.Time
+	mutex      sync.RWMutex
 }
 
-// NewSlidingWindowLimiter creates a new sliding window rate limiter
-func NewSlidingWindowLimiter(config *SlidingWindowConfig) *SlidingWindowLimiter {
+// SlidingWindowRateLimiter implements sliding window rate limiting
+type SlidingWindowRateLimiter struct {
+	config     *SlidingWindowConfig
+	stats      *SlidingWindowStats
+	clients    map[string]*clientEntry // Fallback mode client storage
+	clientsMux sync.RWMutex
+	stopChan   chan struct{}
+	redisMode  bool
+	ctx        context.Context
+	cancel     context.CancelFunc
+}
+
+// NewSlidingWindowRateLimiter creates a new sliding window rate limiter
+func NewSlidingWindowRateLimiter(config *SlidingWindowConfig) *SlidingWindowRateLimiter {
 	if config == nil {
 		config = DefaultSlidingWindowConfig()
 	}
 
 	// Set defaults
-	if config.MaxClients <= 0 {
+	if config.WindowSize == 0 {
+		config.WindowSize = time.Minute
+	}
+	if config.RedisKeyPrefix == "" {
+		config.RedisKeyPrefix = "rate_limit:sliding:"
+	}
+	if config.KeyExtractor == nil {
+		config.KeyExtractor = IPKeyExtractor
+	}
+	if config.MaxClients == 0 {
 		config.MaxClients = 10000
 	}
-	if config.CleanupInterval <= 0 {
-		config.CleanupInterval = config.Window // Cleanup every window duration
+	if config.CleanupInterval == 0 {
+		config.CleanupInterval = time.Minute * 5
 	}
-	if config.ClientKeyFunc == nil {
-		config.ClientKeyFunc = func(c *gin.Context) string {
-			return c.ClientIP() // Default to IP-based
-		}
+	if config.ClientTTL == 0 {
+		config.ClientTTL = time.Hour
 	}
 	if config.ErrorMessage == "" {
-		config.ErrorMessage = "Rate limit exceeded"
+		config.ErrorMessage = "Sliding Window Rate limit exceeded"
 	}
 
-	limiter := &SlidingWindowLimiter{
-		clients:     make(map[string]*ClientWindowEntry),
-		config:      config,
-		stopCleanup: make(chan struct{}),
+	ctx, cancel := context.WithCancel(context.Background())
+
+	swrl := &SlidingWindowRateLimiter{
+		config:    config,
+		clients:   make(map[string]*clientEntry),
+		stopChan:  make(chan struct{}),
+		redisMode: config.RedisClient != nil,
+		ctx:       ctx,
+		cancel:    cancel,
 		stats: &SlidingWindowStats{
 			BaseStats: &BaseStats{
 				StartTime:   time.Now(),
 				LimiterType: SlidingWindowType,
 			},
+			ClientStats: make(map[string]*ClientStats),
 		},
 	}
 
-	// Start cleanup goroutine
-	limiter.startCleanup()
+	// Test Redis connection
+	if swrl.redisMode {
+		if err := swrl.testRedisConnection(); err != nil {
+			if config.EnableFallback {
+				log.Printf("[SLIDING_WINDOW] Redis connection failed, falling back to in-memory: %v", err)
+				swrl.redisMode = false
+				swrl.stats.FallbackMode = true
+			} else {
+				log.Printf("[SLIDING_WINDOW] Redis connection failed and fallback disabled: %v", err)
+			}
+		} else {
+			swrl.stats.RedisMode = true
+		}
+	} else {
+		swrl.stats.FallbackMode = true
+	}
 
-	return limiter
+	// Start cleanup routine for fallback mode
+	if !swrl.redisMode {
+		go swrl.cleanupRoutine()
+	}
+
+	return swrl
 }
 
 // DefaultSlidingWindowConfig returns default configuration
 func DefaultSlidingWindowConfig() *SlidingWindowConfig {
 	return &SlidingWindowConfig{
-		Limit:           100,         // 100 requests
-		Window:          time.Minute, // per minute
-		MaxClients:      10000,       // track up to 10k clients
-		CleanupInterval: time.Minute, // cleanup every minute
+		Rate:            100,
+		WindowSize:      time.Minute,
+		EnableFallback:  true,
+		KeyExtractor:    IPKeyExtractor,
+		MaxClients:      10000,
+		CleanupInterval: time.Minute * 5,
+		ClientTTL:       time.Hour,
 		EnableHeaders:   true,
 		EnableLogging:   false,
 		ErrorMessage:    "Rate limit exceeded",
 	}
 }
 
-// startCleanup starts the cleanup goroutine
-func (swl *SlidingWindowLimiter) startCleanup() {
-	swl.cleanupTicker = time.NewTicker(swl.config.CleanupInterval)
-
-	go func() {
-		for {
-			select {
-			case <-swl.cleanupTicker.C:
-				swl.cleanup()
-			case <-swl.stopCleanup:
-				swl.cleanupTicker.Stop()
-				return
-			}
-		}
-	}()
+// testRedisConnection tests the Redis connection
+func (swrl *SlidingWindowRateLimiter) testRedisConnection() error {
+	if swrl.config.RedisClient == nil {
+		return fmt.Errorf("redis client is nil")
+	}
+	return swrl.config.RedisClient.Ping(swrl.ctx).Err()
 }
 
-// cleanup removes old client entries and expired requests
-func (swl *SlidingWindowLimiter) cleanup() {
-	swl.mu.Lock()
-	defer swl.mu.Unlock()
+// cleanupRoutine cleans up expired client entries in fallback mode
+func (swrl *SlidingWindowRateLimiter) cleanupRoutine() {
+	ticker := time.NewTicker(swrl.config.CleanupInterval)
+	defer ticker.Stop()
 
+	for {
+		select {
+		case <-ticker.C:
+			swrl.cleanupExpiredClients()
+		case <-swrl.stopChan:
+			return
+		}
+	}
+}
+
+// cleanupExpiredClients removes expired client entries
+func (swrl *SlidingWindowRateLimiter) cleanupExpiredClients() {
 	now := time.Now()
-	windowStart := now.Add(-swl.config.Window)
-	clientTTL := swl.config.Window * 2 // Keep clients for 2 window durations
+	expiry := now.Add(-swrl.config.ClientTTL)
 
-	removedClients := 0
-	totalRemovedRequests := 0
+	swrl.clientsMux.Lock()
+	defer swrl.clientsMux.Unlock()
 
-	for clientKey, entry := range swl.clients {
-		entry.mu.Lock()
+	for key, entry := range swrl.clients {
+		entry.mutex.RLock()
+		lastAccess := entry.lastAccess
+		entry.mutex.RUnlock()
 
-		// Remove old requests from this client's window
-		validRequests := make([]time.Time, 0, len(entry.requests))
-		removedRequests := 0
-
-		for _, reqTime := range entry.requests {
-			if reqTime.After(windowStart) {
-				validRequests = append(validRequests, reqTime)
-			} else {
-				removedRequests++
-			}
-		}
-
-		entry.requests = validRequests
-		totalRemovedRequests += removedRequests
-
-		// Check if client should be removed (inactive for too long)
-		shouldRemoveClient := entry.lastAccess.Before(now.Add(-clientTTL)) && len(entry.requests) == 0
-
-		entry.mu.Unlock()
-
-		if shouldRemoveClient {
-			delete(swl.clients, clientKey)
-			removedClients++
+		if lastAccess.Before(expiry) {
+			delete(swrl.clients, key)
 		}
 	}
 
-	// If still over max clients, remove least recently used clients
-	if len(swl.clients) > swl.config.MaxClients {
-		type clientEntry struct {
-			key   string
-			entry *ClientWindowEntry
-		}
-
-		var entries []clientEntry
-		for key, entry := range swl.clients {
-			entries = append(entries, clientEntry{key, entry})
-		}
-
-		// Sort by last access time (oldest first)
-		for i := 0; i < len(entries)-1; i++ {
-			for j := i + 1; j < len(entries); j++ {
-				if entries[i].entry.lastAccess.After(entries[j].entry.lastAccess) {
-					entries[i], entries[j] = entries[j], entries[i]
-				}
-			}
-		}
-
-		// Remove oldest clients until we're under the limit
-		toRemove := len(swl.clients) - swl.config.MaxClients
-		for i := 0; i < toRemove && i < len(entries); i++ {
-			delete(swl.clients, entries[i].key)
-			removedClients++
-		}
-	}
-
-	if swl.config.EnableLogging && (removedClients > 0 || totalRemovedRequests > 0) {
-		log.Printf("Sliding Window Limiter: Cleaned up %d clients, %d requests, active clients: %d",
-			removedClients, totalRemovedRequests, len(swl.clients))
-	}
-
-	// Update stats
-	atomic.StoreInt64(&swl.stats.ActiveClients, int64(len(swl.clients)))
+	// Update active clients count
+	atomic.StoreInt64(&swrl.stats.ActiveClients, int64(len(swrl.clients)))
 }
 
-// getAllowedForClient checks if request is allowed for specific client and updates window
-func (swl *SlidingWindowLimiter) getAllowedForClient(clientKey string, now time.Time) (bool, int, time.Time) {
-	swl.mu.Lock()
-	entry, exists := swl.clients[clientKey]
+// checkRateLimitRedis checks rate limit using Redis with improved script
+func (swrl *SlidingWindowRateLimiter) checkRateLimitRedis(clientKey string) (bool, int, error) {
+	now := time.Now()
+	currentTime := now.UnixMilli() // Use milliseconds for better precision
+	windowSizeMs := swrl.config.WindowSize.Milliseconds()
+
+	// Improved Redis Lua script (based on your better example)
+	script := `
+		local key = KEYS[1]
+		local window = tonumber(ARGV[1])        -- Window size in milliseconds
+		local limit = tonumber(ARGV[2])         -- Rate limit
+		local current_time = tonumber(ARGV[3])  -- Current timestamp in milliseconds
+		
+		-- Remove expired entries (older than window)
+		local cutoff_time = current_time - window
+		redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff_time)
+		
+		-- Count current entries in the window
+		local current_count = redis.call('ZCARD', key)
+		
+		-- Check if limit would be exceeded
+		if current_count >= limit then
+			return {0, current_count, 0}
+		end
+		
+		-- Add current request with unique identifier to handle concurrent requests
+		local unique_id = current_time .. ':' .. math.random(100000, 999999)
+		redis.call('ZADD', key, current_time, unique_id)
+		
+		-- Set expiry slightly longer than window to handle clock drift
+		local expire_seconds = math.ceil(window / 1000) + 5
+		redis.call('EXPIRE', key, expire_seconds)
+		
+		-- Calculate remaining requests
+		local remaining = limit - current_count - 1
+		
+		-- Return: allowed(1), current_count+1, remaining
+		return {1, current_count + 1, remaining}
+	`
+
+	result, err := swrl.config.RedisClient.Eval(swrl.ctx, script, []string{
+		swrl.config.RedisKeyPrefix + clientKey,
+	}, windowSizeMs, swrl.config.Rate, currentTime).Result()
+
+	if err != nil {
+		atomic.AddInt64(&swrl.stats.RedisErrors, 1)
+		return false, 0, err
+	}
+
+	resultSlice, ok := result.([]interface{})
+	if !ok || len(resultSlice) != 3 {
+		return false, 0, fmt.Errorf("unexpected Redis result format")
+	}
+
+	allowed := resultSlice[0].(int64) == 1
+	count := int(resultSlice[1].(int64))
+	// remaining := int(resultSlice[2].(int64))  // Can be used for better headers
+
+	return allowed, count, nil
+}
+
+// checkRateLimitFallback checks rate limit using in-memory storage
+func (swrl *SlidingWindowRateLimiter) checkRateLimitFallback(clientKey string) (bool, int) {
+	now := time.Now()
+	windowStart := now.Add(-swrl.config.WindowSize)
+
+	swrl.clientsMux.Lock()
+	entry, exists := swrl.clients[clientKey]
 	if !exists {
-		// Create new client entry
-		entry = &ClientWindowEntry{
-			requests:   make([]time.Time, 0),
+		entry = &clientEntry{
+			timestamps: make([]time.Time, 0),
 			lastAccess: now,
 		}
-		swl.clients[clientKey] = entry
-		atomic.AddInt64(&swl.stats.TotalClients, 1)
+		swrl.clients[clientKey] = entry
 	}
-	swl.mu.Unlock()
+	swrl.clientsMux.Unlock()
 
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
+	entry.mutex.Lock()
+	defer entry.mutex.Unlock()
 
 	entry.lastAccess = now
-	windowStart := now.Add(-swl.config.Window)
 
-	// Remove expired requests from sliding window
-	validRequests := make([]time.Time, 0, len(entry.requests))
-	for _, reqTime := range entry.requests {
-		if reqTime.After(windowStart) {
-			validRequests = append(validRequests, reqTime)
+	// Remove expired timestamps
+	validTimestamps := make([]time.Time, 0, len(entry.timestamps))
+	for _, ts := range entry.timestamps {
+		if ts.After(windowStart) {
+			validTimestamps = append(validTimestamps, ts)
 		}
 	}
-	entry.requests = validRequests
+	entry.timestamps = validTimestamps
 
-	// Check if we can allow this request
-	currentCount := len(entry.requests)
-	allowed := currentCount < swl.config.Limit
-
-	if allowed {
-		// Add current request to window
-		entry.requests = append(entry.requests, now)
-		currentCount++
+	// Check if limit exceeded
+	if len(entry.timestamps) >= swrl.config.Rate {
+		return false, len(entry.timestamps)
 	}
 
-	// Calculate when window will have space (for retry-after)
-	var oldestRequest time.Time
-	if len(entry.requests) > 0 {
-		oldestRequest = entry.requests[0]
-	} else {
-		oldestRequest = now
-	}
-
-	return allowed, currentCount, oldestRequest
+	// Add current request
+	entry.timestamps = append(entry.timestamps, now)
+	return true, len(entry.timestamps)
 }
 
-// createSlidingWindowRequestInfo creates request info for sliding window
-func (swl *SlidingWindowLimiter) createSlidingWindowRequestInfo(c *gin.Context, clientKey string, allowed bool, currentCount int, oldestRequest time.Time) *SlidingWindowRequestInfo {
+// createRequestInfo creates request information
+func (swrl *SlidingWindowRateLimiter) createRequestInfo(c *gin.Context, clientKey string, allowed bool, requestsInWindow int) *SlidingWindowRequestInfo {
 	now := time.Now()
-	windowStart := now.Add(-swl.config.Window)
-	windowEnd := now
-
-	var retryAfter time.Duration
-	if !allowed && !oldestRequest.IsZero() {
-		// Calculate when the oldest request will expire
-		retryAfter = oldestRequest.Add(swl.config.Window).Sub(now)
-		if retryAfter < 0 {
-			retryAfter = 0
-		}
-	}
+	windowStart := now.Add(-swrl.config.WindowSize)
 
 	return &SlidingWindowRequestInfo{
-		ClientKey:    clientKey,
-		IP:           c.ClientIP(),
-		Path:         c.Request.URL.Path,
-		Method:       c.Request.Method,
-		Timestamp:    now,
-		Allowed:      allowed,
-		CurrentCount: currentCount,
-		Limit:        swl.config.Limit,
-		WindowStart:  windowStart,
-		WindowEnd:    windowEnd,
-		RetryAfter:   retryAfter,
+		BaseRequestInfo: BaseRequestInfo{
+			IP:        c.ClientIP(),
+			Path:      c.Request.URL.Path,
+			Method:    c.Request.Method,
+			UserAgent: c.GetHeader("User-Agent"),
+			Timestamp: now,
+			Allowed:   allowed,
+		},
+		ClientKey:        clientKey,
+		WindowStart:      windowStart,
+		WindowEnd:        now,
+		RequestsInWindow: requestsInWindow,
+		WindowUsage:      float64(requestsInWindow) / float64(swrl.config.Rate),
 	}
 }
 
-// setHeaders sets sliding window rate limit headers
-func (swl *SlidingWindowLimiter) setHeaders(c *gin.Context, info *SlidingWindowRequestInfo) {
-	if !swl.config.EnableHeaders {
+// setHeaders sets rate limit headers
+func (swrl *SlidingWindowRateLimiter) setHeaders(c *gin.Context, remaining int, windowEnd time.Time) {
+	if !swrl.config.EnableHeaders {
 		return
 	}
 
-	remaining := swl.config.Limit - info.CurrentCount
-	if remaining < 0 {
-		remaining = 0
-	}
-
-	c.Header("X-RateLimit-Limit", strconv.Itoa(swl.config.Limit))
+	c.Header("X-RateLimit-Limit", strconv.Itoa(swrl.config.Rate))
 	c.Header("X-RateLimit-Remaining", strconv.Itoa(remaining))
-	c.Header("X-RateLimit-Reset", info.WindowEnd.Add(swl.config.Window).Format(time.RFC3339))
-	c.Header("X-RateLimit-Window", swl.config.Window.String())
-	c.Header("X-RateLimit-Algorithm", "sliding-window")
+	c.Header("X-RateLimit-Reset", windowEnd.Add(swrl.config.WindowSize).Format(time.RFC3339))
+	c.Header("X-RateLimit-Window", swrl.config.WindowSize.String())
+	c.Header("X-RateLimit-Algorithm", swrl.Algorithm().String())
 
-	if !info.Allowed {
-		c.Header("Retry-After", strconv.FormatInt(int64(info.RetryAfter.Seconds()), 10))
+	if swrl.redisMode {
+		c.Header("X-RateLimit-Mode", "redis")
+	} else {
+		c.Header("X-RateLimit-Mode", "memory")
 	}
 }
 
-// logEvent logs sliding window events
-func (swl *SlidingWindowLimiter) logEvent(info *SlidingWindowRequestInfo) {
-	if !swl.config.EnableLogging {
+// logEvent logs rate limiting events
+func (swrl *SlidingWindowRateLimiter) logEvent(info *SlidingWindowRequestInfo) {
+	if !swrl.config.EnableLogging {
 		return
 	}
 
@@ -349,78 +365,136 @@ func (swl *SlidingWindowLimiter) logEvent(info *SlidingWindowRequestInfo) {
 		status = "BLOCKED"
 	}
 
-	log.Printf("[SLIDING_WINDOW_LIMITER] %s - Client: %s, Method: %s, Path: %s, Count: %d/%d, Window: %s",
-		status, info.ClientKey, info.Method, info.Path, info.CurrentCount, info.Limit, swl.config.Window)
+	mode := "MEMORY"
+	if swrl.redisMode {
+		mode = "REDIS"
+	}
+
+	log.Printf("[SLIDING_WINDOW_%s] %s - Client: %s, Method: %s, Path: %s, Usage: %.2f%%, Requests: %d/%d",
+		mode, status, info.ClientKey, info.Method, info.Path,
+		info.WindowUsage*100, info.RequestsInWindow, swrl.config.Rate)
 }
 
-// handleLimitExceeded handles when sliding window limit is exceeded
-func (swl *SlidingWindowLimiter) handleLimitExceeded(c *gin.Context, info *SlidingWindowRequestInfo) {
+// handleLimitExceeded handles when rate limit is exceeded
+func (swrl *SlidingWindowRateLimiter) handleLimitExceeded(c *gin.Context, info *SlidingWindowRequestInfo) {
+	// Set Retry-After header
+	retryAfter := info.WindowEnd.Add(swrl.config.WindowSize).Sub(time.Now())
+	if retryAfter > 0 {
+		SetRetryAfterHeader(c, retryAfter)
+	}
+
 	// Call custom handler if provided
-	if swl.config.OnLimitExceeded != nil {
-		swl.config.OnLimitExceeded(c, info)
+	if swrl.config.OnLimitExceeded != nil {
+		swrl.config.OnLimitExceeded(c, info)
 		return
 	}
 
 	// Use custom error response if provided
-	if swl.config.ErrorResponse != nil {
-		c.JSON(http.StatusTooManyRequests, swl.config.ErrorResponse)
+	if swrl.config.ErrorResponse != nil {
+		c.JSON(http.StatusTooManyRequests, swrl.config.ErrorResponse)
 		c.Abort()
 		return
 	}
 
 	// Default error response
 	c.JSON(http.StatusTooManyRequests, gin.H{
-		"error":         swl.config.ErrorMessage,
-		"client":        info.ClientKey,
-		"limit":         info.Limit,
-		"window":        swl.config.Window.String(),
-		"current_count": info.CurrentCount,
-		"retry_after":   int64(info.RetryAfter.Seconds()),
-		"algorithm":     "sliding-window",
-		"timestamp":     info.Timestamp.Format(time.RFC3339),
+		"error":       swrl.config.ErrorMessage,
+		"message":     fmt.Sprintf("Rate limit exceeded: %d requests in %v window", info.RequestsInWindow, swrl.config.WindowSize),
+		"client":      info.ClientKey,
+		"window":      swrl.config.WindowSize.String(),
+		"algorithm":   swrl.Algorithm().String(),
+		"timestamp":   info.Timestamp.Format(time.RFC3339),
+		"retry_after": retryAfter.Seconds(),
 	})
 	c.Abort()
 }
 
-// Middleware returns the sliding window rate limiting middleware
-func (swl *SlidingWindowLimiter) Middleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		now := time.Now()
+// updateClientStats updates statistics for a specific client
+func (swrl *SlidingWindowRateLimiter) updateClientStats(clientKey string, allowed bool) {
+	swrl.stats.mutex.Lock()
+	defer swrl.stats.mutex.Unlock()
 
-		// Extract client key
-		clientKey := swl.config.ClientKeyFunc(c)
+	clientStats, exists := swrl.stats.ClientStats[clientKey]
+	if !exists {
+		clientStats = &ClientStats{
+			ClientKey: clientKey,
+			FirstSeen: time.Now(),
+			IsActive:  true,
+		}
+		swrl.stats.ClientStats[clientKey] = clientStats
+	}
+
+	clientStats.TotalRequests++
+	clientStats.LastAccess = time.Now()
+	clientStats.IsActive = true
+
+	if allowed {
+		clientStats.AllowedRequests++
+	} else {
+		clientStats.BlockedRequests++
+	}
+}
+
+// Middleware returns the sliding window rate limiting middleware
+func (swrl *SlidingWindowRateLimiter) Middleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Extract a client key
+		clientKey := swrl.config.KeyExtractor(c)
 		if clientKey == "" {
 			clientKey = c.ClientIP() // Fallback to IP
 		}
 
-		// Check if request is allowed
-		allowed, currentCount, oldestRequest := swl.getAllowedForClient(clientKey, now)
+		var allowed bool
+		var requestsInWindow int
+		var err error
 
-		// Update statistics
-		atomic.AddInt64(&swl.stats.TotalRequests, 1)
-		if allowed {
-			atomic.AddInt64(&swl.stats.AllowedRequests, 1)
+		// Check rate limit
+		if swrl.redisMode {
+			allowed, requestsInWindow, err = swrl.checkRateLimitRedis(clientKey)
+			if err != nil && swrl.config.EnableFallback {
+				log.Printf("[SLIDING_WINDOW] Redis error, falling back to memory: %v", err)
+				swrl.redisMode = false
+				swrl.stats.FallbackMode = true
+				allowed, requestsInWindow = swrl.checkRateLimitFallback(clientKey)
+			}
 		} else {
-			atomic.AddInt64(&swl.stats.BlockedRequests, 1)
+			allowed, requestsInWindow = swrl.checkRateLimitFallback(clientKey)
 		}
 
+		// Update global statistics
+		atomic.AddInt64(&swrl.stats.TotalRequests, 1)
+		if allowed {
+			atomic.AddInt64(&swrl.stats.AllowedRequests, 1)
+		} else {
+			atomic.AddInt64(&swrl.stats.BlockedRequests, 1)
+		}
+
+		// Update client statistics
+		swrl.updateClientStats(clientKey, allowed)
+
 		// Create request info
-		info := swl.createSlidingWindowRequestInfo(c, clientKey, allowed, currentCount, oldestRequest)
+		info := swrl.createRequestInfo(c, clientKey, allowed, requestsInWindow)
+
+		// Calculate remaining requests
+		remaining := swrl.config.Rate - requestsInWindow
+		if remaining < 0 {
+			remaining = 0
+		}
 
 		// Set headers
-		swl.setHeaders(c, info)
+		swrl.setHeaders(c, remaining, info.WindowEnd)
 
 		// Log event
-		swl.logEvent(info)
+		swrl.logEvent(info)
 
-		// Call request handler if provided
-		if swl.config.OnRequestProcessed != nil {
-			swl.config.OnRequestProcessed(c, info, allowed)
+		// Call request processed handler if provided
+		if swrl.config.OnRequestProcessed != nil {
+			swrl.config.OnRequestProcessed(c, info, allowed)
 		}
 
 		// Handle rate limit exceeded
 		if !allowed {
-			swl.handleLimitExceeded(c, info)
+			swrl.handleLimitExceeded(c, info)
 			return
 		}
 
@@ -428,158 +502,95 @@ func (swl *SlidingWindowLimiter) Middleware() gin.HandlerFunc {
 	}
 }
 
-// GetStats returns sliding window statistics
-func (swl *SlidingWindowLimiter) GetStats() Stats {
-	atomic.StoreInt64(&swl.stats.ActiveClients, int64(len(swl.clients)))
-	return swl.stats.Clone()
+// GetStats returns rate limiting statistics
+func (swrl *SlidingWindowRateLimiter) GetStats() Stats {
+	// Update live counters
+	swrl.stats.TotalRequests = atomic.LoadInt64(&swrl.stats.BaseStats.TotalRequests)
+	swrl.stats.AllowedRequests = atomic.LoadInt64(&swrl.stats.BaseStats.AllowedRequests)
+	swrl.stats.BlockedRequests = atomic.LoadInt64(&swrl.stats.BaseStats.BlockedRequests)
+	swrl.stats.ActiveClients = int64(len(swrl.clients))
+	swrl.stats.RedisMode = swrl.redisMode
+	return swrl.stats
 }
 
-// GetClientStats returns current window statistics for a specific client
-func (swl *SlidingWindowLimiter) GetClientStats(clientKey string) map[string]interface{} {
-	swl.mu.RLock()
-	entry, exists := swl.clients[clientKey]
-	swl.mu.RUnlock()
+// GetClientStats returns statistics for a specific client
+func (swrl *SlidingWindowRateLimiter) GetClientStats(clientKey string) ClientStats {
+	swrl.stats.mutex.RLock()
+	defer swrl.stats.mutex.RUnlock()
 
-	if !exists {
-		return map[string]interface{}{
-			"exists":        false,
-			"current_count": 0,
-			"limit":         swl.config.Limit,
-			"window":        swl.config.Window.String(),
+	if stats, exists := swrl.stats.ClientStats[clientKey]; exists {
+		return *stats
+	}
+	return ClientStats{ClientKey: clientKey}
+}
+
+// ResetClient resets rate limiting for a specific client
+func (swrl *SlidingWindowRateLimiter) ResetClient(clientKey string) {
+	if swrl.redisMode {
+		swrl.config.RedisClient.Del(swrl.ctx, swrl.config.RedisKeyPrefix+clientKey)
+	} else {
+		swrl.clientsMux.Lock()
+		delete(swrl.clients, clientKey)
+		swrl.clientsMux.Unlock()
+	}
+
+	// Reset client stats
+	swrl.stats.mutex.Lock()
+	delete(swrl.stats.ClientStats, clientKey)
+	swrl.stats.mutex.Unlock()
+}
+
+// ListActiveClients returns a list of currently active clients
+func (swrl *SlidingWindowRateLimiter) ListActiveClients() []string {
+	swrl.stats.mutex.RLock()
+	defer swrl.stats.mutex.RUnlock()
+
+	clients := make([]string, 0, len(swrl.stats.ClientStats))
+	for clientKey, stats := range swrl.stats.ClientStats {
+		if stats.IsActive {
+			clients = append(clients, clientKey)
 		}
 	}
+	return clients
+}
 
-	entry.mu.RLock()
-	defer entry.mu.RUnlock()
-
-	now := time.Now()
-	windowStart := now.Add(-swl.config.Window)
-
-	// Count valid requests in current window
-	validCount := 0
-	for _, reqTime := range entry.requests {
-		if reqTime.After(windowStart) {
-			validCount++
-		}
+// GetClientCount returns the number of active clients
+func (swrl *SlidingWindowRateLimiter) GetClientCount() int {
+	if swrl.redisMode {
+		// For Redis mode, this is an approximation
+		return len(swrl.ListActiveClients())
 	}
 
-	return map[string]interface{}{
-		"exists":        true,
-		"current_count": validCount,
-		"limit":         swl.config.Limit,
-		"window":        swl.config.Window.String(),
-		"last_access":   entry.lastAccess,
-		"remaining":     swl.config.Limit - validCount,
-	}
+	swrl.clientsMux.RLock()
+	defer swrl.clientsMux.RUnlock()
+	return len(swrl.clients)
 }
 
-// ResetClientWindow resets the sliding window for a specific client
-func (swl *SlidingWindowLimiter) ResetClientWindow(clientKey string) {
-	swl.mu.RLock()
-	entry, exists := swl.clients[clientKey]
-	swl.mu.RUnlock()
+// ResetStats resets all statistics
+func (swrl *SlidingWindowRateLimiter) ResetStats() {
+	atomic.StoreInt64(&swrl.stats.BaseStats.TotalRequests, 0)
+	atomic.StoreInt64(&swrl.stats.BaseStats.AllowedRequests, 0)
+	atomic.StoreInt64(&swrl.stats.BaseStats.BlockedRequests, 0)
+	atomic.StoreInt64(&swrl.stats.RedisErrors, 0)
+	swrl.stats.BaseStats.StartTime = time.Now()
 
-	if exists {
-		entry.mu.Lock()
-		entry.requests = make([]time.Time, 0)
-		entry.mu.Unlock()
-	}
+	swrl.stats.mutex.Lock()
+	swrl.stats.ClientStats = make(map[string]*ClientStats)
+	swrl.stats.mutex.Unlock()
 }
 
-// ResetStats resets all sliding window statistics
-func (swl *SlidingWindowLimiter) ResetStats() {
-	atomic.StoreInt64(&swl.stats.TotalRequests, 0)
-	atomic.StoreInt64(&swl.stats.AllowedRequests, 0)
-	atomic.StoreInt64(&swl.stats.BlockedRequests, 0)
-	swl.stats.StartTime = time.Now()
+// Stop gracefully stops the rate limiter
+func (swrl *SlidingWindowRateLimiter) Stop() {
+	close(swrl.stopChan)
+	swrl.cancel()
 }
 
-func (swl *SlidingWindowLimiter) Stop() {
-	close(swl.stopCleanup)
-}
-
-func (swl *SlidingWindowLimiter) Type() RateLimiterType {
+// Type returns the type of rate limiter
+func (swrl *SlidingWindowRateLimiter) Type() RateLimiterType {
 	return SlidingWindowType
 }
 
-func (swl *SlidingWindowLimiter) Algorithm() Algorithm {
+// Algorithm returns the algorithm used
+func (swrl *SlidingWindowRateLimiter) Algorithm() Algorithm {
 	return SlidingWindowAlg
-}
-
-// =============================================================================
-// CONVENIENCE FUNCTIONS
-// =============================================================================
-
-// SlidingWindowRateLimitMiddleware creates a simple sliding window rate limiter
-func SlidingWindowRateLimitMiddleware(limit int, window time.Duration) gin.HandlerFunc {
-	config := &SlidingWindowConfig{
-		Limit:         limit,
-		Window:        window,
-		EnableHeaders: true,
-	}
-	limiter := NewSlidingWindowLimiter(config)
-	return limiter.Middleware()
-}
-
-// IPSlidingWindowRateLimitMiddleware creates IP-based sliding window rate limiter
-func IPSlidingWindowRateLimitMiddleware(limit int, window time.Duration) gin.HandlerFunc {
-	config := &SlidingWindowConfig{
-		Limit:         limit,
-		Window:        window,
-		EnableHeaders: true,
-		ClientKeyFunc: func(c *gin.Context) string {
-			return "ip:" + c.ClientIP()
-		},
-	}
-	limiter := NewSlidingWindowLimiter(config)
-	return limiter.Middleware()
-}
-
-// UserSlidingWindowRateLimitMiddleware creates user-based sliding window rate limiter
-func UserSlidingWindowRateLimitMiddleware(limit int, window time.Duration) gin.HandlerFunc {
-	config := &SlidingWindowConfig{
-		Limit:         limit,
-		Window:        window,
-		EnableHeaders: true,
-		EnableLogging: true,
-		ClientKeyFunc: func(c *gin.Context) string {
-			userID := c.GetHeader("X-User-ID")
-			if userID == "" {
-				return "anonymous:" + c.ClientIP()
-			}
-			return "user:" + userID
-		},
-	}
-	limiter := NewSlidingWindowLimiter(config)
-	return limiter.Middleware()
-}
-
-// PreciseSlidingWindowRateLimitMiddleware creates precise time-based sliding window limiter
-func (swl *SlidingWindowLimiter) PreciseSlidingWindowRateLimitMiddleware(limit int, window time.Duration) gin.HandlerFunc {
-	config := &SlidingWindowConfig{
-		Limit:         limit,
-		Window:        window,
-		EnableHeaders: true,
-		EnableLogging: true,
-		ClientKeyFunc: func(c *gin.Context) string {
-			return c.ClientIP()
-		},
-		OnLimitExceeded: func(c *gin.Context, info *SlidingWindowRequestInfo) {
-			c.JSON(http.StatusTooManyRequests, gin.H{
-				"error": "Precise rate limit exceeded",
-				"details": gin.H{
-					"limit":         info.Limit,
-					"window":        swl.config.Window.String(),
-					"current_count": info.CurrentCount,
-					"window_start":  info.WindowStart.Format(time.RFC3339),
-					"window_end":    info.WindowEnd.Format(time.RFC3339),
-					"retry_after":   int64(info.RetryAfter.Seconds()),
-					"algorithm":     "sliding-window",
-				},
-			})
-			c.Abort()
-		},
-	}
-	limiter := NewSlidingWindowLimiter(config)
-	return limiter.Middleware()
 }
