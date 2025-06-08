@@ -11,10 +11,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// =============================================================================
-// SECURITY CONFIGURATION
-// =============================================================================
-
 // SecurityConfig contains all security-related configurations
 type SecurityConfig struct {
 	// IP-based security
@@ -60,10 +56,6 @@ func DefaultSecurityConfig() *SecurityConfig {
 		MaxConcurrentReqs:     100, // 100 concurrent requests per IP
 	}
 }
-
-// =============================================================================
-// SECURITY MIDDLEWARE
-// =============================================================================
 
 // SecurityMiddleware provides comprehensive security features
 type SecurityMiddleware struct {
@@ -119,10 +111,6 @@ func (sm *SecurityMiddleware) buildLookupMaps() {
 		sm.apiKeyMap[key] = true
 	}
 }
-
-// =============================================================================
-// SECURITY CHECKS
-// =============================================================================
 
 // isIPWhitelisted checks if IP is in whitelist
 func (sm *SecurityMiddleware) isIPWhitelisted(ip string) bool {
@@ -243,10 +231,6 @@ func (sm *SecurityMiddleware) trackSuspiciousActivity(ip string) {
 	}
 }
 
-// =============================================================================
-// BOT DETECTION
-// =============================================================================
-
 // detectBot performs basic bot detection
 func (sm *SecurityMiddleware) detectBot(c *gin.Context) bool {
 	if !sm.config.EnableBotDetection {
@@ -281,10 +265,6 @@ func (sm *SecurityMiddleware) detectBot(c *gin.Context) bool {
 	return false
 }
 
-// =============================================================================
-// CONCURRENT REQUEST TRACKING
-// =============================================================================
-
 // trackConcurrentRequest tracks concurrent requests per IP
 func (sm *SecurityMiddleware) trackConcurrentRequest(ip string) bool {
 	if sm.config.MaxConcurrentReqs <= 0 {
@@ -316,10 +296,6 @@ func (sm *SecurityMiddleware) releaseConcurrentRequest(ip string) {
 	}
 }
 
-// =============================================================================
-// SECURITY HEADERS
-// =============================================================================
-
 // setSecurityHeaders sets common security headers
 func (sm *SecurityMiddleware) setSecurityHeaders(c *gin.Context) {
 	if !sm.config.EnableSecurityHeaders {
@@ -339,10 +315,6 @@ func (sm *SecurityMiddleware) setSecurityHeaders(c *gin.Context) {
 		c.Header(header, value)
 	}
 }
-
-// =============================================================================
-// MIDDLEWARE IMPLEMENTATION
-// =============================================================================
 
 // Middleware returns the security middleware function
 func (sm *SecurityMiddleware) Middleware() gin.HandlerFunc {
@@ -453,10 +425,6 @@ func (sm *SecurityMiddleware) Middleware() gin.HandlerFunc {
 	}
 }
 
-// =============================================================================
-// HONEYPOT IMPLEMENTATION
-// =============================================================================
-
 // isHoneypotRequest checks if request is targeting honeypot endpoints
 func (sm *SecurityMiddleware) isHoneypotRequest(c *gin.Context) bool {
 	honeypotPaths := []string{
@@ -481,10 +449,6 @@ func (sm *SecurityMiddleware) isHoneypotRequest(c *gin.Context) bool {
 
 	return false
 }
-
-// =============================================================================
-// CLEANUP ROUTINE
-// =============================================================================
 
 // cleanupRoutine periodically cleans up expired data
 func (sm *SecurityMiddleware) cleanupRoutine() {
@@ -518,10 +482,6 @@ func (sm *SecurityMiddleware) cleanup() {
 		return true
 	})
 }
-
-// =============================================================================
-// ENHANCED RATE LIMITER WITH SECURITY
-// =============================================================================
 
 // SecureRateLimiterConfig extends rate limiter config with security features
 type SecureRateLimiterConfig struct {
@@ -581,10 +541,6 @@ func (srl *SecureTokenBucketRateLimiter) Middleware() gin.HandlerFunc {
 		rateLimitMiddleware(c)
 	}
 }
-
-// =============================================================================
-// SECURITY MANAGEMENT ENDPOINTS
-// =============================================================================
 
 // SecurityManager provides endpoints for security management
 type SecurityManager struct {
@@ -693,9 +649,7 @@ func (sm *SecurityManager) getConcurrentRequests() []map[string]interface{} {
 	return concurrent
 }
 
-// =============================================================================
-// USAGE EXAMPLE
-// =============================================================================
+// example usage:
 
 /*
 func main() {
