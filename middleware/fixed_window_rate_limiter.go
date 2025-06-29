@@ -7,6 +7,7 @@ package middleware
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"strconv"
 	"sync"
@@ -20,6 +21,29 @@ import (
 
 var _ RateLimiter = (*FixedWindowRateLimiter)(nil)
 
+// RateLimitError represents a rate limiting error with detailed information
+type RateLimitError struct {
+	Type       string        `json:"type"`
+	Message    string        `json:"message"`
+	ClientKey  string        `json:"client_key"`
+	RetryAfter time.Duration `json:"retry_after"`
+	WindowInfo *WindowInfo   `json:"window_info"`
+}
+
+func (e *RateLimitError) Error() string {
+	return e.Message
+}
+
+// WindowInfo provides information about the current window
+type WindowInfo struct {
+	Number      int64         `json:"number"`
+	Start       time.Time     `json:"start"`
+	End         time.Time     `json:"end"`
+	Usage       float64       `json:"usage"`
+	Remaining   int           `json:"remaining"`
+	TimeToReset time.Duration `json:"time_to_reset"`
+}
+
 // FixedWindowConfig configuration for fixed window rate limiter
 type FixedWindowConfig struct {
 	Rate               int           // Requests per window
@@ -29,14 +53,44 @@ type FixedWindowConfig struct {
 	EnableFallback     bool          // Enable fallback to in-memory when Redis fails
 	KeyExtractor       KeyExtractor  // Function to extract a client key
 	MaxClients         int           // Maximum clients to track (fallback mode)
+	MaxTrackedClients  int           // Maximum clients to track in statistics
 	CleanupInterval    time.Duration // Cleanup interval (fallback mode)
 	ClientTTL          time.Duration // Client TTL (fallback mode)
 	EnableHeaders      bool          // Include rate limit headers
 	EnableLogging      bool          // Enable logging
+	EnableJitter       bool          // Enable jitter to prevent thundering herd
 	ErrorMessage       string        // Custom error message
 	ErrorResponse      interface{}   // Custom error response structure
+	MetricsCollector   Metrics       // Optional metrics collector
+	RequestTimeout     time.Duration // Timeout for Redis operations
 	OnLimitExceeded    func(*gin.Context, *FixedWindowRequestInfo)
 	OnRequestProcessed func(*gin.Context, *FixedWindowRequestInfo, bool)
+}
+
+// Validate validates the configuration
+func (config *FixedWindowConfig) Validate() error {
+	if config.Rate <= 0 {
+		return fmt.Errorf("rate must be positive, got %d", config.Rate)
+	}
+	if config.WindowSize <= 0 {
+		return fmt.Errorf("window size must be positive, got %v", config.WindowSize)
+	}
+	if config.MaxClients <= 0 {
+		return fmt.Errorf("max clients must be positive, got %d", config.MaxClients)
+	}
+	if config.MaxTrackedClients <= 0 {
+		return fmt.Errorf("max tracked clients must be positive, got %d", config.MaxTrackedClients)
+	}
+	if config.ClientTTL <= 0 {
+		return fmt.Errorf("client TTL must be positive, got %v", config.ClientTTL)
+	}
+	if config.CleanupInterval <= 0 {
+		return fmt.Errorf("cleanup interval must be positive, got %v", config.CleanupInterval)
+	}
+	if config.RequestTimeout <= 0 {
+		return fmt.Errorf("request timeout must be positive, got %v", config.RequestTimeout)
+	}
+	return nil
 }
 
 // FixedWindowRequestInfo contains request information for fixed window limiter
@@ -65,26 +119,103 @@ type FixedWindowStats struct {
 
 // fixedWindowEntry represents a client's window data in fallback mode
 type fixedWindowEntry struct {
-	count       int
+	count       int64
 	windowStart time.Time
 	lastAccess  time.Time
-	mutex       sync.RWMutex
+}
+
+// lruNode represents a node in the LRU cache for client statistics
+type lruNode struct {
+	key  string
+	prev *lruNode
+	next *lruNode
+}
+
+// lruCache implements LRU eviction for client statistics
+type lruCache struct {
+	capacity int
+	cache    map[string]*lruNode
+	head     *lruNode
+	tail     *lruNode
+	mutex    sync.Mutex
+}
+
+func newLRUCache(capacity int) *lruCache {
+	head := &lruNode{}
+	tail := &lruNode{}
+	head.next = tail
+	tail.prev = head
+
+	return &lruCache{
+		capacity: capacity,
+		cache:    make(map[string]*lruNode),
+		head:     head,
+		tail:     tail,
+	}
+}
+
+func (lru *lruCache) access(key string) {
+	lru.mutex.Lock()
+	defer lru.mutex.Unlock()
+
+	if node, exists := lru.cache[key]; exists {
+		lru.moveToHead(node)
+		return
+	}
+
+	node := &lruNode{key: key}
+	lru.cache[key] = node
+	lru.addToHead(node)
+
+	if len(lru.cache) > lru.capacity {
+		tail := lru.removeTail()
+		delete(lru.cache, tail.key)
+	}
+}
+
+func (lru *lruCache) moveToHead(node *lruNode) {
+	lru.removeNode(node)
+	lru.addToHead(node)
+}
+
+func (lru *lruCache) addToHead(node *lruNode) {
+	node.prev = lru.head
+	node.next = lru.head.next
+	lru.head.next.prev = node
+	lru.head.next = node
+}
+
+func (lru *lruCache) removeNode(node *lruNode) {
+	node.prev.next = node.next
+	node.next.prev = node.prev
+}
+
+func (lru *lruCache) removeTail() *lruNode {
+	lastNode := lru.tail.prev
+	lru.removeNode(lastNode)
+	return lastNode
+}
+
+func (lru *lruCache) shouldEvict(key string) bool {
+	lru.mutex.Lock()
+	defer lru.mutex.Unlock()
+
+	_, exists := lru.cache[key]
+	return !exists && len(lru.cache) >= lru.capacity
 }
 
 // FixedWindowRateLimiter implements fixed window rate limiting
 type FixedWindowRateLimiter struct {
 	config     *FixedWindowConfig
 	stats      *FixedWindowStats
-	clients    map[string]*fixedWindowEntry // Fallback mode client storage
-	clientsMux sync.RWMutex
+	clients    sync.Map // map[string]*fixedWindowEntry - Better concurrent performance
+	clientsLRU *lruCache
 	stopChan   chan struct{}
 	redisMode  bool
-	ctx        context.Context
-	cancel     context.CancelFunc
 }
 
 // NewFixedWindowRateLimiter creates a new fixed window rate limiter
-func NewFixedWindowRateLimiter(config *FixedWindowConfig) *FixedWindowRateLimiter {
+func NewFixedWindowRateLimiter(config *FixedWindowConfig) (*FixedWindowRateLimiter, error) {
 	if config == nil {
 		config = DefaultFixedWindowConfig()
 	}
@@ -102,25 +233,32 @@ func NewFixedWindowRateLimiter(config *FixedWindowConfig) *FixedWindowRateLimite
 	if config.MaxClients == 0 {
 		config.MaxClients = 10000
 	}
+	if config.MaxTrackedClients == 0 {
+		config.MaxTrackedClients = 1000
+	}
 	if config.CleanupInterval == 0 {
 		config.CleanupInterval = time.Minute * 5
 	}
 	if config.ClientTTL == 0 {
 		config.ClientTTL = time.Hour
 	}
+	if config.RequestTimeout == 0 {
+		config.RequestTimeout = time.Second * 5
+	}
 	if config.ErrorMessage == "" {
 		config.ErrorMessage = "Fixed Window Rate limit exceeded"
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// Validate configuration
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
 
 	fwrl := &FixedWindowRateLimiter{
-		config:    config,
-		clients:   make(map[string]*fixedWindowEntry),
-		stopChan:  make(chan struct{}),
-		redisMode: config.RedisClient != nil,
-		ctx:       ctx,
-		cancel:    cancel,
+		config:     config,
+		clientsLRU: newLRUCache(config.MaxTrackedClients),
+		stopChan:   make(chan struct{}),
+		redisMode:  config.RedisClient != nil,
 		stats: &FixedWindowStats{
 			BaseStats: &BaseStats{
 				StartTime:   time.Now(),
@@ -138,7 +276,7 @@ func NewFixedWindowRateLimiter(config *FixedWindowConfig) *FixedWindowRateLimite
 				fwrl.redisMode = false
 				fwrl.stats.FallbackMode = true
 			} else {
-				log.Printf("[FIXED_WINDOW] Redis connection failed and fallback disabled: %v", err)
+				return nil, fmt.Errorf("redis connection failed and fallback disabled: %w", err)
 			}
 		} else {
 			fwrl.stats.RedisMode = true
@@ -152,22 +290,25 @@ func NewFixedWindowRateLimiter(config *FixedWindowConfig) *FixedWindowRateLimite
 		go fwrl.cleanupRoutine()
 	}
 
-	return fwrl
+	return fwrl, nil
 }
 
 // DefaultFixedWindowConfig returns default configuration
 func DefaultFixedWindowConfig() *FixedWindowConfig {
 	return &FixedWindowConfig{
-		Rate:            100,
-		WindowSize:      time.Minute,
-		EnableFallback:  true,
-		KeyExtractor:    IPKeyExtractor,
-		MaxClients:      10000,
-		CleanupInterval: time.Minute * 5,
-		ClientTTL:       time.Hour,
-		EnableHeaders:   true,
-		EnableLogging:   false,
-		ErrorMessage:    "Rate limit exceeded",
+		Rate:              100,
+		WindowSize:        time.Minute,
+		EnableFallback:    true,
+		KeyExtractor:      IPKeyExtractor,
+		MaxClients:        10000,
+		MaxTrackedClients: 1000,
+		CleanupInterval:   time.Minute * 5,
+		ClientTTL:         time.Hour,
+		RequestTimeout:    time.Second * 5,
+		EnableHeaders:     true,
+		EnableLogging:     false,
+		EnableJitter:      false,
+		ErrorMessage:      "Rate limit exceeded",
 	}
 }
 
@@ -176,12 +317,26 @@ func (fwrl *FixedWindowRateLimiter) testRedisConnection() error {
 	if fwrl.config.RedisClient == nil {
 		return fmt.Errorf("redis client is nil")
 	}
-	return fwrl.config.RedisClient.Ping(fwrl.ctx).Err()
+
+	ctx, cancel := context.WithTimeout(context.Background(), fwrl.config.RequestTimeout)
+	defer cancel()
+
+	return fwrl.config.RedisClient.Ping(ctx).Err()
 }
 
 // getWindowNumber calculates the current window number for consistent windowing
-func (fwrl *FixedWindowRateLimiter) getWindowNumber(t time.Time) int64 {
-	return t.Unix() / int64(fwrl.config.WindowSize.Seconds())
+func (fwrl *FixedWindowRateLimiter) getWindowNumber(t time.Time, clientKey string) int64 {
+	baseWindow := t.Unix() / int64(fwrl.config.WindowSize.Seconds())
+
+	// Add deterministic jitter based on client key to prevent thundering herd
+	if fwrl.config.EnableJitter {
+		hash := fnv.New32a()
+		hash.Write([]byte(clientKey))
+		jitter := int64(hash.Sum32() % uint32(fwrl.config.WindowSize.Seconds()/10))
+		return (t.Unix() + jitter) / int64(fwrl.config.WindowSize.Seconds())
+	}
+
+	return baseWindow
 }
 
 // getWindowStart calculates the start time of the current window
@@ -190,16 +345,25 @@ func (fwrl *FixedWindowRateLimiter) getWindowStart(windowNumber int64) time.Time
 }
 
 // checkRateLimitRedis checks rate limit using Redis
-func (fwrl *FixedWindowRateLimiter) checkRateLimitRedis(clientKey string) (bool, int, int64, error) {
+func (fwrl *FixedWindowRateLimiter) checkRateLimitRedis(ctx context.Context, clientKey string) (bool, int, int64, error) {
 	now := time.Now()
-	windowNumber := fwrl.getWindowNumber(now)
+	windowNumber := fwrl.getWindowNumber(now, clientKey)
 
-	// Redis Lua script for fixed window rate limiting
+	// Enhanced Redis Lua script for fixed window rate limiting with better error handling
 	script := `
 		local key = KEYS[1]
 		local window_number = ARGV[1]
 		local rate_limit = tonumber(ARGV[2])
 		local expire_seconds = tonumber(ARGV[3])
+		
+		-- Input validation
+		if not rate_limit or rate_limit <= 0 then
+			return redis.error_reply("Invalid rate limit: " .. tostring(ARGV[2]))
+		end
+		
+		if not window_number then
+			return redis.error_reply("Invalid window number: " .. tostring(ARGV[1]))
+		end
 		
 		-- Create window-specific key
 		local window_key = key .. ":" .. window_number
@@ -212,34 +376,41 @@ func (fwrl *FixedWindowRateLimiter) checkRateLimitRedis(clientKey string) (bool,
 			redis.call('EXPIRE', window_key, expire_seconds)
 		end
 		
-		-- Check if limit exceeded
-		if current_count > rate_limit then
-			return {0, current_count, window_number}
+		-- Get TTL for better reset time calculation
+		local ttl = redis.call('TTL', window_key)
+		if ttl == -1 then
+			-- Key exists but has no TTL, set it
+			redis.call('EXPIRE', window_key, expire_seconds)
+			ttl = expire_seconds
 		end
 		
-		-- Return allowed, count, window_number
-		return {1, current_count, window_number}
+		-- Check if limit exceeded
+		local allowed = current_count <= rate_limit and 1 or 0
+		
+		-- Return allowed, count, window_number, ttl
+		return {allowed, current_count, window_number, ttl}
 	`
 
 	expireSeconds := int64(fwrl.config.WindowSize.Seconds()) + 60 // Add buffer
 
-	result, err := fwrl.config.RedisClient.Eval(fwrl.ctx, script, []string{
+	result, err := fwrl.config.RedisClient.Eval(ctx, script, []string{
 		fwrl.config.RedisKeyPrefix + clientKey,
 	}, windowNumber, fwrl.config.Rate, expireSeconds).Result()
 
 	if err != nil {
 		atomic.AddInt64(&fwrl.stats.RedisErrors, 1)
+		fwrl.recordMetric("redis_errors", 1, map[string]string{"client": clientKey})
 		return false, 0, windowNumber, err
 	}
 
 	resultSlice, ok := result.([]interface{})
-	if !ok || len(resultSlice) != 3 {
-		return false, 0, windowNumber, fmt.Errorf("unexpected Redis result format")
+	if !ok || len(resultSlice) != 4 {
+		return false, 0, windowNumber, fmt.Errorf("unexpected Redis result format: %v", result)
 	}
 
 	allowed := resultSlice[0].(int64) == 1
 	count := int(resultSlice[1].(int64))
-	returnedWindow, _ := strconv.ParseInt(resultSlice[2].(string), 10, 64)
+	returnedWindow := resultSlice[2].(int64)
 
 	return allowed, count, returnedWindow, nil
 }
@@ -247,42 +418,38 @@ func (fwrl *FixedWindowRateLimiter) checkRateLimitRedis(clientKey string) (bool,
 // checkRateLimitFallback checks rate limit using in-memory storage
 func (fwrl *FixedWindowRateLimiter) checkRateLimitFallback(clientKey string) (bool, int, int64) {
 	now := time.Now()
-	windowNumber := fwrl.getWindowNumber(now)
+	windowNumber := fwrl.getWindowNumber(now, clientKey)
 	windowStart := fwrl.getWindowStart(windowNumber)
 
-	fwrl.clientsMux.Lock()
-	entry, exists := fwrl.clients[clientKey]
-	if !exists {
-		entry = &fixedWindowEntry{
-			count:       0,
-			windowStart: windowStart,
-			lastAccess:  now,
-		}
-		fwrl.clients[clientKey] = entry
-	}
-	fwrl.clientsMux.Unlock()
+	// Load or create entry using sync.Map for better concurrent performance
+	value, _ := fwrl.clients.LoadOrStore(clientKey, &fixedWindowEntry{
+		count:       0,
+		windowStart: windowStart,
+		lastAccess:  now,
+	})
 
-	entry.mutex.Lock()
-	defer entry.mutex.Unlock()
+	entry := value.(*fixedWindowEntry)
 
+	// Use atomic operations for better performance
 	entry.lastAccess = now
 
 	// Check if we're in a new window
 	if entry.windowStart.Before(windowStart) {
-		// New window, reset counter
-		entry.count = 0
+		// New window, reset counter atomically
+		atomic.StoreInt64(&entry.count, 0)
 		entry.windowStart = windowStart
 		atomic.AddInt64(&fwrl.stats.WindowsProcessed, 1)
 	}
 
 	// Check if limit exceeded
-	if entry.count >= fwrl.config.Rate {
-		return false, entry.count, windowNumber
+	currentCount := atomic.LoadInt64(&entry.count)
+	if currentCount >= int64(fwrl.config.Rate) {
+		return false, int(currentCount), windowNumber
 	}
 
-	// Increment counter
-	entry.count++
-	return true, entry.count, windowNumber
+	// Increment counter atomically
+	newCount := atomic.AddInt64(&entry.count, 1)
+	return true, int(newCount), windowNumber
 }
 
 // cleanupRoutine cleans up expired client entries in fallback mode
@@ -304,22 +471,29 @@ func (fwrl *FixedWindowRateLimiter) cleanupRoutine() {
 func (fwrl *FixedWindowRateLimiter) cleanupExpiredClients() {
 	now := time.Now()
 	expiry := now.Add(-fwrl.config.ClientTTL)
+	deletedCount := 0
 
-	fwrl.clientsMux.Lock()
-	defer fwrl.clientsMux.Unlock()
-
-	for key, entry := range fwrl.clients {
-		entry.mutex.RLock()
-		lastAccess := entry.lastAccess
-		entry.mutex.RUnlock()
-
-		if lastAccess.Before(expiry) {
-			delete(fwrl.clients, key)
+	fwrl.clients.Range(func(key, value interface{}) bool {
+		entry := value.(*fixedWindowEntry)
+		if entry.lastAccess.Before(expiry) {
+			fwrl.clients.Delete(key)
+			deletedCount++
 		}
+		return true
+	})
+
+	// Update metrics
+	if deletedCount > 0 {
+		fwrl.recordMetric("clients_cleaned", float64(deletedCount), nil)
 	}
 
 	// Update active clients count
-	atomic.StoreInt64(&fwrl.stats.ActiveClients, int64(len(fwrl.clients)))
+	activeCount := int64(0)
+	fwrl.clients.Range(func(key, value interface{}) bool {
+		activeCount++
+		return true
+	})
+	atomic.StoreInt64(&fwrl.stats.ActiveClients, activeCount)
 }
 
 // createRequestInfo creates request information
@@ -370,6 +544,21 @@ func (fwrl *FixedWindowRateLimiter) setHeaders(c *gin.Context, remaining int, re
 	}
 }
 
+// recordMetric records a metric if metrics collector is configured
+func (fwrl *FixedWindowRateLimiter) recordMetric(name string, value float64, tags map[string]string) {
+	if fwrl.config.MetricsCollector != nil {
+		if tags == nil {
+			tags = make(map[string]string)
+		}
+		tags["limiter_type"] = "fixed_window"
+		tags["mode"] = "memory"
+		if fwrl.redisMode {
+			tags["mode"] = "redis"
+		}
+		fwrl.config.MetricsCollector.RecordHistogram(name, value, tags)
+	}
+}
+
 // logEvent logs rate limiting events
 func (fwrl *FixedWindowRateLimiter) logEvent(info *FixedWindowRequestInfo) {
 	if !fwrl.config.EnableLogging {
@@ -411,28 +600,53 @@ func (fwrl *FixedWindowRateLimiter) handleLimitExceeded(c *gin.Context, info *Fi
 		return
 	}
 
+	// Create structured error response
+	rateLimitError := &RateLimitError{
+		Type:       "fixed_window_rate_limit_exceeded",
+		Message:    fwrl.config.ErrorMessage,
+		ClientKey:  info.ClientKey,
+		RetryAfter: info.TimeToReset,
+		WindowInfo: &WindowInfo{
+			Number:      info.WindowNumber,
+			Start:       info.WindowStart,
+			End:         info.WindowEnd,
+			Usage:       info.WindowUsage,
+			Remaining:   fwrl.config.Rate - info.RequestsInWindow,
+			TimeToReset: info.TimeToReset,
+		},
+	}
+
 	// Default error response
 	c.JSON(http.StatusTooManyRequests, gin.H{
-		"error":         fwrl.config.ErrorMessage,
-		"message":       fmt.Sprintf("Rate limit exceeded: %d requests in %v window", info.RequestsInWindow, fwrl.config.WindowSize),
-		"client":        info.ClientKey,
-		"window_number": info.WindowNumber,
-		"window_size":   fwrl.config.WindowSize.String(),
-		"reset_time":    info.WindowEnd.Format(time.RFC3339),
-		"time_to_reset": info.TimeToReset.Seconds(),
-		"algorithm":     fwrl.Algorithm().String(),
-		"timestamp":     info.Timestamp.Format(time.RFC3339),
+		"error":       rateLimitError.Message,
+		"type":        rateLimitError.Type,
+		"client":      rateLimitError.ClientKey,
+		"window_info": rateLimitError.WindowInfo,
+		"retry_after": rateLimitError.RetryAfter.Seconds(),
+		"algorithm":   fwrl.Algorithm().String(),
+		"timestamp":   info.Timestamp.Format(time.RFC3339),
 	})
 	c.Abort()
 }
 
-// updateClientStats updates statistics for a specific client
+// updateClientStats updates statistics for a specific client with LRU eviction
 func (fwrl *FixedWindowRateLimiter) updateClientStats(clientKey string, allowed bool) {
+	// Check if we should evict before adding
+	if fwrl.clientsLRU.shouldEvict(clientKey) {
+		return // Skip tracking to prevent memory bloat
+	}
+
 	fwrl.stats.mutex.Lock()
 	defer fwrl.stats.mutex.Unlock()
 
 	clientStats, exists := fwrl.stats.ClientStats[clientKey]
 	if !exists {
+		// Check bounds again with lock held
+		if len(fwrl.stats.ClientStats) >= fwrl.config.MaxTrackedClients {
+			// Evict oldest client
+			fwrl.evictOldestClientLocked()
+		}
+
 		clientStats = &ClientStats{
 			ClientKey: clientKey,
 			FirstSeen: time.Now(),
@@ -440,6 +654,9 @@ func (fwrl *FixedWindowRateLimiter) updateClientStats(clientKey string, allowed 
 		}
 		fwrl.stats.ClientStats[clientKey] = clientStats
 	}
+
+	// Update LRU cache
+	fwrl.clientsLRU.access(clientKey)
 
 	clientStats.TotalRequests++
 	clientStats.LastAccess = time.Now()
@@ -452,9 +669,30 @@ func (fwrl *FixedWindowRateLimiter) updateClientStats(clientKey string, allowed 
 	}
 }
 
+// evictOldestClientLocked evicts the oldest client from statistics (must be called with lock held)
+func (fwrl *FixedWindowRateLimiter) evictOldestClientLocked() {
+	var oldestKey string
+	var oldestTime time.Time
+
+	for key, stats := range fwrl.stats.ClientStats {
+		if oldestKey == "" || stats.FirstSeen.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = stats.FirstSeen
+		}
+	}
+
+	if oldestKey != "" {
+		delete(fwrl.stats.ClientStats, oldestKey)
+	}
+}
+
 // Middleware returns the fixed window rate limiting middleware
 func (fwrl *FixedWindowRateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Create request-specific context with timeout
+		ctx, cancel := context.WithTimeout(c.Request.Context(), fwrl.config.RequestTimeout)
+		defer cancel()
+
 		// Extract a client key
 		clientKey := fwrl.config.KeyExtractor(c)
 		if clientKey == "" {
@@ -466,9 +704,11 @@ func (fwrl *FixedWindowRateLimiter) Middleware() gin.HandlerFunc {
 		var windowNumber int64
 		var err error
 
+		startTime := time.Now()
+
 		// Check rate limit
 		if fwrl.redisMode {
-			allowed, requestsInWindow, windowNumber, err = fwrl.checkRateLimitRedis(clientKey)
+			allowed, requestsInWindow, windowNumber, err = fwrl.checkRateLimitRedis(ctx, clientKey)
 			if err != nil && fwrl.config.EnableFallback {
 				log.Printf("[FIXED_WINDOW] Redis error, falling back to memory: %v", err)
 				fwrl.redisMode = false
@@ -478,6 +718,13 @@ func (fwrl *FixedWindowRateLimiter) Middleware() gin.HandlerFunc {
 		} else {
 			allowed, requestsInWindow, windowNumber = fwrl.checkRateLimitFallback(clientKey)
 		}
+
+		// Record operation duration
+		duration := time.Since(startTime)
+		fwrl.recordMetric("rate_limit_check_duration_ms", float64(duration.Milliseconds()), map[string]string{
+			"client":  clientKey,
+			"allowed": strconv.FormatBool(allowed),
+		})
 
 		// Update global statistics
 		atomic.AddInt64(&fwrl.stats.TotalRequests, 1)
@@ -505,6 +752,12 @@ func (fwrl *FixedWindowRateLimiter) Middleware() gin.HandlerFunc {
 		// Log event
 		fwrl.logEvent(info)
 
+		// Record metrics
+		fwrl.recordMetric("requests_total", 1, map[string]string{
+			"client":  clientKey,
+			"allowed": strconv.FormatBool(allowed),
+		})
+
 		// Call request processed handler if provided
 		if fwrl.config.OnRequestProcessed != nil {
 			fwrl.config.OnRequestProcessed(c, info, allowed)
@@ -521,12 +774,12 @@ func (fwrl *FixedWindowRateLimiter) Middleware() gin.HandlerFunc {
 }
 
 // GetStats returns rate limiting statistics
-func (fwrl *FixedWindowRateLimiter) GetStats() Stats {
+func (fwrl *FixedWindowRateLimiter) GetStats() interface{} {
 	// Update live counters
 	fwrl.stats.TotalRequests = atomic.LoadInt64(&fwrl.stats.BaseStats.TotalRequests)
 	fwrl.stats.AllowedRequests = atomic.LoadInt64(&fwrl.stats.BaseStats.AllowedRequests)
 	fwrl.stats.BlockedRequests = atomic.LoadInt64(&fwrl.stats.BaseStats.BlockedRequests)
-	fwrl.stats.ActiveClients = int64(len(fwrl.clients))
+	fwrl.stats.ActiveClients = atomic.LoadInt64(&fwrl.stats.ActiveClients)
 	fwrl.stats.RedisMode = fwrl.redisMode
 	return fwrl.stats
 }
@@ -544,17 +797,18 @@ func (fwrl *FixedWindowRateLimiter) GetClientStats(clientKey string) ClientStats
 
 // ResetClient resets rate limiting for a specific client
 func (fwrl *FixedWindowRateLimiter) ResetClient(clientKey string) {
+	ctx, cancel := context.WithTimeout(context.Background(), fwrl.config.RequestTimeout)
+	defer cancel()
+
 	if fwrl.redisMode {
 		// Delete all window keys for this client (pattern match)
 		pattern := fwrl.config.RedisKeyPrefix + clientKey + ":*"
-		keys, err := fwrl.config.RedisClient.Keys(fwrl.ctx, pattern).Result()
+		keys, err := fwrl.config.RedisClient.Keys(ctx, pattern).Result()
 		if err == nil && len(keys) > 0 {
-			fwrl.config.RedisClient.Del(fwrl.ctx, keys...)
+			fwrl.config.RedisClient.Del(ctx, keys...)
 		}
 	} else {
-		fwrl.clientsMux.Lock()
-		delete(fwrl.clients, clientKey)
-		fwrl.clientsMux.Unlock()
+		fwrl.clients.Delete(clientKey)
 	}
 
 	// Reset client stats
@@ -584,9 +838,12 @@ func (fwrl *FixedWindowRateLimiter) GetClientCount() int {
 		return len(fwrl.ListActiveClients())
 	}
 
-	fwrl.clientsMux.RLock()
-	defer fwrl.clientsMux.RUnlock()
-	return len(fwrl.clients)
+	count := 0
+	fwrl.clients.Range(func(key, value interface{}) bool {
+		count++
+		return true
+	})
+	return count
 }
 
 // ResetStats resets all statistics
@@ -601,12 +858,14 @@ func (fwrl *FixedWindowRateLimiter) ResetStats() {
 	fwrl.stats.mutex.Lock()
 	fwrl.stats.ClientStats = make(map[string]*ClientStats)
 	fwrl.stats.mutex.Unlock()
+
+	// Reset LRU cache
+	fwrl.clientsLRU = newLRUCache(fwrl.config.MaxTrackedClients)
 }
 
 // Stop gracefully stops the rate limiter
 func (fwrl *FixedWindowRateLimiter) Stop() {
 	close(fwrl.stopChan)
-	fwrl.cancel()
 }
 
 // Type returns the type of rate limiter
