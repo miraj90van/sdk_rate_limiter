@@ -1,6 +1,7 @@
 // middleware/middleware.go
 // Purpose: Common types, interfaces, and utilities shared across all rate limiters
 // This file defines the contracts and common functionality for the rate limiting SDK
+// Updated to support optimized rate limiter implementations
 
 package middleware
 
@@ -74,35 +75,10 @@ func (a Algorithm) String() string {
 }
 
 // =============================================================================
-// CORE INTERFACES
+// CORE INTERFACES - UPDATED FOR FLEXIBILITY
 // =============================================================================
 
-// RateLimiter is the common interface that all rate limiters must implement
-type RateLimiter interface {
-	// Middleware returns the Gin middleware function
-	Middleware() gin.HandlerFunc
-
-	// GetStats returns statistics about the rate limiter
-	GetStats() Stats
-
-	// ResetStats resets all statistics
-	ResetStats()
-
-	// Stop gracefully stops the rate limiter (cleanup goroutines, etc.)
-	Stop()
-
-	// Type returns the type of rate limiter
-	Type() RateLimiterType
-
-	// Algorithm returns the algorithm used
-	Algorithm() Algorithm
-}
-
-// =============================================================================
-// COMMON TYPES & STRUCTS
-// =============================================================================
-
-// Stats is the common interface for all rate limiter statistics
+// Stats is the base interface for all rate limiter statistics
 type Stats interface {
 	// GetTotalRequests returns total number of requests processed
 	GetTotalRequests() int64
@@ -125,6 +101,43 @@ type Stats interface {
 	// GetType returns the rate limiter type
 	GetType() RateLimiterType
 }
+
+// RateLimiter is the common interface that all rate limiters must implement
+// Updated to support flexible stats return types
+type RateLimiter interface {
+	// Middleware returns the Gin middleware function
+	Middleware() gin.HandlerFunc
+
+	// GetStats returns statistics about the rate limiter (flexible return type)
+	GetStats() interface{}
+
+	// ResetStats resets all statistics
+	ResetStats()
+
+	// Stop gracefully stops the rate limiter (cleanup goroutines, etc.)
+	Stop()
+
+	// Type returns the type of rate limiter
+	Type() RateLimiterType
+
+	// Algorithm returns the algorithm used
+	Algorithm() Algorithm
+}
+
+// ExtendedRateLimiter provides additional functionality for client management
+type ExtendedRateLimiter interface {
+	RateLimiter
+
+	// Client management methods
+	GetClientStats(clientKey string) ClientStats
+	ResetClient(clientKey string)
+	ListActiveClients() []string
+	GetClientCount() int
+}
+
+// =============================================================================
+// COMMON TYPES & STRUCTS
+// =============================================================================
 
 // BaseStats provides a common implementation of Stats interface
 type BaseStats struct {
@@ -166,6 +179,157 @@ func (cs *ClientStats) GetSuccessRate() float64 {
 	}
 	return float64(cs.AllowedRequests) / float64(cs.TotalRequests)
 }
+
+// =============================================================================
+// STATS ADAPTER FOR FLEXIBILITY
+// =============================================================================
+
+// StatsAdapter adapts any stats struct to the Stats interface
+type StatsAdapter struct {
+	rawStats        interface{}
+	totalRequests   int64
+	allowedRequests int64
+	blockedRequests int64
+	startTime       time.Time
+	limiterType     RateLimiterType
+}
+
+// NewStatsAdapter creates a new stats adapter from any stats object
+func NewStatsAdapter(rawStats interface{}) *StatsAdapter {
+	adapter := &StatsAdapter{
+		rawStats: rawStats,
+	}
+
+	// Use reflection or type assertions to extract common fields
+	adapter.extractCommonFields()
+	return adapter
+}
+
+// extractCommonFields extracts common statistics fields from the raw stats
+func (sa *StatsAdapter) extractCommonFields() {
+	switch stats := sa.rawStats.(type) {
+	case *FixedWindowStats:
+		if stats.BaseStats != nil {
+			sa.totalRequests = stats.BaseStats.TotalRequests
+			sa.allowedRequests = stats.BaseStats.AllowedRequests
+			sa.blockedRequests = stats.BaseStats.BlockedRequests
+			sa.startTime = stats.BaseStats.StartTime
+			sa.limiterType = stats.BaseStats.LimiterType
+		}
+	case *SlidingWindowStats:
+		if stats.BaseStats != nil {
+			sa.totalRequests = stats.BaseStats.TotalRequests
+			sa.allowedRequests = stats.BaseStats.AllowedRequests
+			sa.blockedRequests = stats.BaseStats.BlockedRequests
+			sa.startTime = stats.BaseStats.StartTime
+			sa.limiterType = stats.BaseStats.LimiterType
+		}
+	case *LeakyBucketStats:
+		if stats.BaseStats != nil {
+			sa.totalRequests = stats.BaseStats.TotalRequests
+			sa.allowedRequests = stats.BaseStats.AllowedRequests
+			sa.blockedRequests = stats.BaseStats.BlockedRequests
+			sa.startTime = stats.BaseStats.StartTime
+			sa.limiterType = stats.BaseStats.LimiterType
+		}
+	case *TokenBucketStats:
+		if stats.BaseStats != nil {
+			sa.totalRequests = stats.BaseStats.TotalRequests
+			sa.allowedRequests = stats.BaseStats.AllowedRequests
+			sa.blockedRequests = stats.BaseStats.BlockedRequests
+			sa.startTime = stats.BaseStats.StartTime
+			sa.limiterType = stats.BaseStats.LimiterType
+		}
+	case Stats:
+		// Already implements Stats interface
+		sa.totalRequests = stats.GetTotalRequests()
+		sa.allowedRequests = stats.GetAllowedRequests()
+		sa.blockedRequests = stats.GetBlockedRequests()
+		sa.startTime = stats.GetStartTime()
+		sa.limiterType = stats.GetType()
+	default:
+		// Unknown type, use defaults
+		sa.limiterType = BasicType
+		sa.startTime = time.Now()
+	}
+}
+
+// Implement Stats interface
+func (sa *StatsAdapter) GetTotalRequests() int64   { return sa.totalRequests }
+func (sa *StatsAdapter) GetAllowedRequests() int64 { return sa.allowedRequests }
+func (sa *StatsAdapter) GetBlockedRequests() int64 { return sa.blockedRequests }
+func (sa *StatsAdapter) GetStartTime() time.Time   { return sa.startTime }
+func (sa *StatsAdapter) GetType() RateLimiterType  { return sa.limiterType }
+func (sa *StatsAdapter) GetUptime() time.Duration  { return time.Since(sa.startTime) }
+func (sa *StatsAdapter) GetSuccessRate() float64 {
+	if sa.totalRequests == 0 {
+		return 1.0
+	}
+	return float64(sa.allowedRequests) / float64(sa.totalRequests)
+}
+
+// GetRawStats returns the original stats object
+func (sa *StatsAdapter) GetRawStats() interface{} {
+	return sa.rawStats
+}
+
+// =============================================================================
+// FORWARD DECLARATIONS FOR SPECIFIC STATS TYPES
+// =============================================================================
+
+// These types will be defined in the individual rate limiter files
+// Here we just provide type declarations for the adapter
+
+//type FixedWindowStats struct {
+//	*BaseStats
+//	ActiveClients      int64                   `json:"active_clients"`
+//	RedisMode          bool                    `json:"redis_mode"`
+//	FallbackMode       bool                    `json:"fallback_mode"`
+//	RedisErrors        int64                   `json:"redis_errors"`
+//	WindowsProcessed   int64                   `json:"windows_processed"`
+//	ClientStats        map[string]*ClientStats `json:"client_stats"`
+//}
+//
+//type SlidingWindowStats struct {
+//	*BaseStats
+//	ActiveClients      int64                   `json:"active_clients"`
+//	RedisMode          bool                    `json:"redis_mode"`
+//	FallbackMode       bool                    `json:"fallback_mode"`
+//	RedisErrors        int64                   `json:"redis_errors"`
+//	TimestampsStored   int64                   `json:"timestamps_stored"`
+//	MemoryUsageBytes   int64                   `json:"memory_usage_bytes"`
+//	AverageWindowUsage float64                 `json:"average_window_usage"`
+//	ClientStats        map[string]*ClientStats `json:"client_stats"`
+//}
+//
+//type LeakyBucketStats struct {
+//	*BaseStats
+//	ActiveClients      int64                   `json:"active_clients"`
+//	RedisMode          bool                    `json:"redis_mode"`
+//	FallbackMode       bool                    `json:"fallback_mode"`
+//	RedisErrors        int64                   `json:"redis_errors"`
+//	QueuedRequests     int64                   `json:"queued_requests"`
+//	DroppedRequests    int64                   `json:"dropped_requests"`
+//	QueueTimeouts      int64                   `json:"queue_timeouts"`
+//	AverageWaitTime    time.Duration           `json:"average_wait_time"`
+//	AverageBucketUsage float64                 `json:"average_bucket_usage"`
+//	ClientStats        map[string]*ClientStats `json:"client_stats"`
+//}
+//
+//type TokenBucketStats struct {
+//	*BaseStats
+//	ActiveClients      int64                   `json:"active_clients"`
+//	RedisMode          bool                    `json:"redis_mode"`
+//	FallbackMode       bool                    `json:"fallback_mode"`
+//	RedisErrors        int64                   `json:"redis_errors"`
+//	WaitingRequests    int64                   `json:"waiting_requests"`
+//	QueueTimeouts      int64                   `json:"queue_timeouts"`
+//	TokensConsumed     int64                   `json:"tokens_consumed"`
+//	TokensRefilled     int64                   `json:"tokens_refilled"`
+//	AverageWaitTime    time.Duration           `json:"average_wait_time"`
+//	AverageTokenUsage  float64                 `json:"average_token_usage"`
+//	ClientStats        map[string]*ClientStats `json:"client_stats"`
+//}
 
 // =============================================================================
 // COMMON CONFIGURATION TYPES
@@ -329,7 +493,7 @@ func CreateCompositeKeyExtractor(extractors ...KeyExtractor) KeyExtractor {
 }
 
 // =============================================================================
-// MIDDLEWARE REGISTRY
+// ENHANCED MIDDLEWARE REGISTRY
 // =============================================================================
 
 // MiddlewareRegistry manages registered rate limiters
@@ -386,11 +550,34 @@ func (mr *MiddlewareRegistry) List() []string {
 }
 
 // GetAllStats returns statistics for all registered rate limiters
+// Updated to handle flexible stats return types
 func (mr *MiddlewareRegistry) GetAllStats() map[string]Stats {
 	mr.mu.RLock()
 	defer mr.mu.RUnlock()
 
 	stats := make(map[string]Stats)
+	for name, limiter := range mr.limiters {
+		rawStats := limiter.GetStats()
+
+		// Convert to Stats interface using adapter
+		if statsInterface, ok := rawStats.(Stats); ok {
+			// Already implements Stats interface
+			stats[name] = statsInterface
+		} else {
+			// Use adapter to convert
+			adapter := NewStatsAdapter(rawStats)
+			stats[name] = adapter
+		}
+	}
+	return stats
+}
+
+// GetAllRawStats returns raw statistics for all registered rate limiters
+func (mr *MiddlewareRegistry) GetAllRawStats() map[string]interface{} {
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+
+	stats := make(map[string]interface{})
 	for name, limiter := range mr.limiters {
 		stats[name] = limiter.GetStats()
 	}
@@ -438,6 +625,16 @@ func (mr *MiddlewareRegistry) GetSummaryStats() map[string]interface{} {
 	return summary
 }
 
+// GetExtendedLimiter retrieves a rate limiter as ExtendedRateLimiter if supported
+func (mr *MiddlewareRegistry) GetExtendedLimiter(name string) (ExtendedRateLimiter, bool) {
+	if limiter, exists := mr.Get(name); exists {
+		if extended, ok := limiter.(ExtendedRateLimiter); ok {
+			return extended, true
+		}
+	}
+	return nil, false
+}
+
 // Stop stops all registered rate limiters
 func (mr *MiddlewareRegistry) Stop() {
 	mr.mu.Lock()
@@ -448,6 +645,28 @@ func (mr *MiddlewareRegistry) Stop() {
 	}
 	// Clear the map
 	mr.limiters = make(map[string]RateLimiter)
+}
+
+// =============================================================================
+// TYPE ASSERTION HELPERS
+// =============================================================================
+
+// GetSpecificStats safely extracts specific stats types
+func GetSpecificStats(stats interface{}) (Stats, interface{}) {
+	switch s := stats.(type) {
+	case *FixedWindowStats:
+		return NewStatsAdapter(s), s
+	case *SlidingWindowStats:
+		return NewStatsAdapter(s), s
+	case *LeakyBucketStats:
+		return NewStatsAdapter(s), s
+	case *TokenBucketStats:
+		return NewStatsAdapter(s), s
+	case Stats:
+		return s, s
+	default:
+		return NewStatsAdapter(s), s
+	}
 }
 
 // =============================================================================
@@ -466,20 +685,79 @@ func SetRetryAfterHeader(c *gin.Context, retryAfter time.Duration) {
 	c.Header("Retry-After", fmt.Sprintf("%d", int64(retryAfter.Seconds())))
 }
 
-// EstimateRemainingFromReservation estimates remaining capacity using rate.Limiter reservation
-func EstimateRemainingFromReservation(limiter *rate.Limiter, burst int) int {
-	reservation := limiter.Reserve()
-	if !reservation.OK() {
-		reservation.Cancel()
-		return 0
+// Metrics interface for external metrics collection
+type Metrics interface {
+	IncrementCounter(name string, tags map[string]string)
+	RecordHistogram(name string, value float64, tags map[string]string)
+	SetGauge(name string, value float64, tags map[string]string)
+}
+
+// =============================================================================
+// ENHANCED HELPER FUNCTIONS
+// =============================================================================
+
+// GetDetailedInfo retrieves detailed information for a rate limiter
+func GetDetailedInfo(limiter RateLimiter, clientKey string) interface{} {
+	// Try to get detailed info based on limiter type
+	switch limiter.Type() {
+	case SlidingWindowType:
+		// Try to call GetWindowInfo if available
+		if v := tryCallMethod(limiter, "GetWindowInfo", clientKey); v != nil {
+			return v
+		}
+	case LeakyBucketType:
+		// Try to call GetBucketInfo if available
+		if v := tryCallMethod(limiter, "GetBucketInfo", clientKey); v != nil {
+			return v
+		}
+	case TokenBucketType:
+		// Try to call GetBucketInfo if available
+		if v := tryCallMethod(limiter, "GetBucketInfo", clientKey); v != nil {
+			return v
+		}
 	}
 
-	delay := reservation.Delay()
-	reservation.Cancel()
-
-	if delay <= 0 {
-		return burst - 1
+	// Fallback to ExtendedRateLimiter interface
+	if extended, ok := limiter.(ExtendedRateLimiter); ok {
+		return extended.GetClientStats(clientKey)
 	}
 
-	return 0
+	// Last resort: return basic info
+	return map[string]interface{}{
+		"message": "Detailed info not available",
+		"type":    limiter.Type().String(),
+		"stats":   limiter.GetStats(),
+	}
+}
+
+// tryCallMethod attempts to call a method on an interface using reflection
+func tryCallMethod(obj interface{}, methodName string, args ...interface{}) interface{} {
+	// This is a simplified version - in a real implementation you might use reflection
+	// For now, we'll use type assertions for known types
+
+	switch v := obj.(type) {
+	case interface{ GetWindowInfo(string) interface{} }:
+		if methodName == "GetWindowInfo" && len(args) == 1 {
+			if clientKey, ok := args[0].(string); ok {
+				return v.GetWindowInfo(clientKey)
+			}
+		}
+	case interface{ GetBucketInfo(string) interface{} }:
+		if methodName == "GetBucketInfo" && len(args) == 1 {
+			if clientKey, ok := args[0].(string); ok {
+				return v.GetBucketInfo(clientKey)
+			}
+		}
+	}
+
+	return nil
+}
+
+// ResetLimiterClient resets a specific client for a rate limiter
+func ResetLimiterClient(limiter RateLimiter, clientKey string) error {
+	if extended, ok := limiter.(ExtendedRateLimiter); ok {
+		extended.ResetClient(clientKey)
+		return nil
+	}
+	return NewRateLimiterError("OPERATION_NOT_SUPPORTED", "client reset not supported for this limiter type")
 }

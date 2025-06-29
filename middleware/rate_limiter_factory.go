@@ -37,68 +37,96 @@ func (factory *RateLimiterFactory) CreateBasicRateLimiter(requestsPerSecond floa
 	return NewBasicRateLimiter(config)
 }
 
-func (factory *RateLimiterFactory) CreateTokenBucketRateLimiter(requestsPerSecond float64, burst int) RateLimiter {
+func (factory *RateLimiterFactory) CreateTokenBucketRateLimiter(requestsPerSecond float64, burst int) (RateLimiter, error) {
 	config := &TokenBucketConfig{
-		Rate:           rate.Limit(requestsPerSecond),
-		Burst:          burst,
-		KeyExtractor:   IPKeyExtractor,
-		EnableHeaders:  true,
-		EnableFallback: true,
-		RedisClient:    factory.getRedisClient(),
-		ErrorMessage:   "Token Bucket Rate limit exceeded",
+		Rate:                rate.Limit(requestsPerSecond),
+		Burst:               burst,
+		KeyExtractor:        IPKeyExtractor,
+		EnableHeaders:       true,
+		EnableFallback:      true,
+		RedisClient:         factory.getRedisClient(),
+		ErrorMessage:        "Token Bucket Rate limit exceeded",
+		RedisKeyPrefix:      "rate_limit:token:",
+		MaxClients:          10000,
+		MaxTrackedClients:   1000,
+		CleanupInterval:     time.Minute * 5,
+		ClientTTL:           time.Hour,
+		RequestTimeout:      time.Second * 5,
+		EnableLogging:       true,
+		EnableJitter:        true,
+		AllowWaiting:        false, // Set to true to enable request waiting
+		MaxWaitTime:         time.Second * 5,
+		MaxTokensPerRequest: 10, // Maximum tokens per request
+		MetricsCollector:    nil,
 	}
 	return NewTokenBucketRateLimiter(config)
 }
 
-func (factory *RateLimiterFactory) CreateSlidingWindowsRateLimiter(requestsPerSecond int, burst int) RateLimiter {
+func (factory *RateLimiterFactory) CreateSlidingWindowsRateLimiter(requestsPerSecond int, burst int) (RateLimiter, error) {
 	config := &SlidingWindowConfig{
-		Rate:            requestsPerSecond,
-		RedisClient:     factory.getRedisClient(),
-		WindowSize:      time.Minute,
-		EnableFallback:  true,
-		KeyExtractor:    IPKeyExtractor,
-		MaxClients:      10000,
-		CleanupInterval: time.Minute * 5,
-		ClientTTL:       time.Hour,
-		EnableHeaders:   true,
-		EnableLogging:   false,
-		ErrorMessage:    "Sliding Windows Rate limit exceeded",
+		Rate:                   requestsPerSecond,
+		RedisClient:            factory.getRedisClient(),
+		WindowSize:             time.Minute,
+		EnableFallback:         true,
+		KeyExtractor:           IPKeyExtractor,
+		MaxClients:             10000,
+		CleanupInterval:        time.Minute * 5,
+		ClientTTL:              time.Hour,
+		EnableHeaders:          true,
+		EnableLogging:          false,
+		ErrorMessage:           "Sliding Windows Rate limit exceeded",
+		RedisKeyPrefix:         "rate_limit:sliding:",
+		MaxTrackedClients:      1000,
+		RequestTimeout:         time.Second * 5,
+		EnableJitter:           true,
+		MaxTimestampsPerClient: 200, // 2x rate for burst handling
+		MetricsCollector:       nil, // Add your metrics collector here if needed
 	}
 	return NewSlidingWindowRateLimiter(config)
 }
 
-func (factory *RateLimiterFactory) CreateFixedWindowRateLimiter(requestsPerSecond int, burst int) RateLimiter {
+func (factory *RateLimiterFactory) CreateFixedWindowRateLimiter(requestsPerSecond int, burst int) (RateLimiter, error) {
 	config := &FixedWindowConfig{
-		Rate:            requestsPerSecond,
-		RedisClient:     factory.getRedisClient(),
-		WindowSize:      time.Minute,
-		EnableFallback:  true,
-		KeyExtractor:    IPKeyExtractor,
-		MaxClients:      10000,
-		CleanupInterval: time.Minute * 5,
-		ClientTTL:       time.Hour,
-		EnableHeaders:   true,
-		EnableLogging:   false,
-		ErrorMessage:    "Fixed Window Rate limit exceeded",
+		Rate:              requestsPerSecond,
+		RedisClient:       factory.getRedisClient(),
+		WindowSize:        time.Minute,
+		EnableFallback:    true,
+		KeyExtractor:      IPKeyExtractor,
+		MaxClients:        10000,
+		CleanupInterval:   time.Minute * 5,
+		ClientTTL:         time.Hour,
+		EnableHeaders:     true,
+		EnableLogging:     true,
+		ErrorMessage:      "Fixed Window Rate limit exceeded",
+		RedisKeyPrefix:    "rate_limit:fixed:",
+		MaxTrackedClients: 1000,
+		RequestTimeout:    time.Second * 5,
+		EnableJitter:      true,
+		MetricsCollector:  nil, // Add your metrics collector here if needed
 	}
 	return NewFixedWindowRateLimiter(config)
 }
 
-func (factory *RateLimiterFactory) CreateLeakyBucketRateLimiter(requestsPerSecond float64, buffer int) RateLimiter {
+func (factory *RateLimiterFactory) CreateLeakyBucketRateLimiter(requestsPerSecond float64, buffer int) (RateLimiter, error) {
 	config := &LeakyBucketConfig{
-		RedisClient:     factory.getRedisClient(),
-		LeakRate:        requestsPerSecond,
-		Capacity:        buffer,
-		EnableFallback:  true,
-		KeyExtractor:    IPKeyExtractor,
-		MaxClients:      10000,
-		CleanupInterval: time.Minute * 5,
-		ClientTTL:       time.Hour,
-		EnableHeaders:   true,
-		EnableLogging:   false,
-		AllowQueueing:   false,
-		MaxQueueTime:    time.Second * 10,
-		ErrorMessage:    "Leaky Bucket Rate limit exceeded",
+		RedisClient:       factory.getRedisClient(),
+		LeakRate:          requestsPerSecond,
+		Capacity:          buffer,
+		EnableFallback:    true,
+		KeyExtractor:      IPKeyExtractor,
+		MaxClients:        10000,
+		CleanupInterval:   time.Minute * 5,
+		ClientTTL:         time.Hour,
+		EnableHeaders:     true,
+		EnableLogging:     true,
+		AllowQueueing:     false,
+		MaxQueueTime:      time.Second * 10,
+		ErrorMessage:      "Leaky Bucket Rate limit exceeded",
+		RedisKeyPrefix:    "rate_limit:leaky:",
+		MaxTrackedClients: 1000,
+		RequestTimeout:    time.Second * 5,
+		EnableJitter:      true,
+		MetricsCollector:  nil, // Add your metrics collector here if needed
 	}
 	return NewLeakyBucketRateLimiter(config)
 }

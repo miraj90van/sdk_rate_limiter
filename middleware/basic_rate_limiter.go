@@ -194,7 +194,7 @@ func (brl *BasicRateLimiter) Middleware() gin.HandlerFunc {
 }
 
 // GetStats returns global rate limiting statistics
-func (brl *BasicRateLimiter) GetStats() Stats {
+func (brl *BasicRateLimiter) GetStats() interface{} {
 	// Update live counters
 	brl.stats.TotalRequests = atomic.LoadInt64(&brl.stats.BaseStats.TotalRequests)
 	brl.stats.AllowedRequests = atomic.LoadInt64(&brl.stats.BaseStats.AllowedRequests)

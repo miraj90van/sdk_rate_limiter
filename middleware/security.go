@@ -504,7 +504,7 @@ func NewSecureTokenBucketRateLimiter(config *SecureRateLimiterConfig) *SecureTok
 		}
 	}
 
-	rateLimiter := NewTokenBucketRateLimiter(config.TokenBucketConfig)
+	rateLimiter, _ := NewTokenBucketRateLimiter(config.TokenBucketConfig)
 	securityMiddleware := NewSecurityMiddleware(config.Security)
 
 	return &SecureTokenBucketRateLimiter{

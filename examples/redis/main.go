@@ -27,7 +27,7 @@ func main() {
 func setupRateLimiter(r *gin.Engine) {
 
 	// Initialize Redis client:
-	redisClient, err := component.NewRedisClient("localhost:63792", "", 0)
+	redisClient, err := component.NewRedisClient("localhost:6379", "", 0)
 	if err != nil {
 		log.Printf("Redis connection failed: %v", err)
 		log.Println("Falling back to in-memory rate limiting...")
@@ -44,25 +44,25 @@ func setupRateLimiter(r *gin.Engine) {
 	// Create a route group for Redis-backed rate limiting:
 	redisGroup := r.Group("/api")
 
-	basicLimiter := middleware.RateLimitProcessor.CreateTokenBucketRateLimiter(5, 2)
+	basicLimiter := middleware.RateLimitProcessor.CreateBasicRateLimiter(5, 2)
 	middleware.RateLimitRegistry.Register("basic", basicLimiter)
 	//redisGroup.Use(basicLimiter.Middleware())
 
-	tokenBucketLimiter := middleware.RateLimitProcessor.CreateTokenBucketRateLimiter(5, 2)
+	tokenBucketLimiter, _ := middleware.RateLimitProcessor.CreateTokenBucketRateLimiter(3, 50)
 	middleware.RateLimitRegistry.Register("token_bucket", tokenBucketLimiter)
-	//redisGroup.Use(tokenBucketLimiter.Middleware())
+	redisGroup.Use(tokenBucketLimiter.Middleware())
 
-	slidingWindowLimiter := middleware.RateLimitProcessor.CreateSlidingWindowsRateLimiter(10, 2)
+	slidingWindowLimiter, _ := middleware.RateLimitProcessor.CreateSlidingWindowsRateLimiter(10, 2)
 	middleware.RateLimitRegistry.Register("sliding_window", slidingWindowLimiter)
 	//redisGroup.Use(slidingWindowLimiter.Middleware())
 
-	fixedWindowLimiter := middleware.RateLimitProcessor.CreateFixedWindowRateLimiter(10, 2)
+	fixedWindowLimiter, err := middleware.RateLimitProcessor.CreateFixedWindowRateLimiter(10, 2)
 	middleware.RateLimitRegistry.Register("fixed_window", fixedWindowLimiter)
 	//redisGroup.Use(fixedWindowLimiter.Middleware())
 
-	leakyBucketLimiter := middleware.RateLimitProcessor.CreateLeakyBucketRateLimiter(10, 2)
+	leakyBucketLimiter, _ := middleware.RateLimitProcessor.CreateLeakyBucketRateLimiter(10, 20)
 	middleware.RateLimitRegistry.Register("leaky_bucket", leakyBucketLimiter)
-	redisGroup.Use(leakyBucketLimiter.Middleware())
+	//redisGroup.Use(leakyBucketLimiter.Middleware())
 
 	redisGroup.GET("/test", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
